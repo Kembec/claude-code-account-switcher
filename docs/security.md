@@ -1,7 +1,8 @@
 # Security notes
 
-`ccp` moves OAuth credentials between entries in your own login keychain. That
-deserves a straight account of what it touches, so here it is.
+`ccp` moves OAuth credentials between stores that belong to you — entries in your own
+login keychain on macOS, files under your own home directory elsewhere. That deserves a
+straight account of what it touches, so here it is.
 
 ## What it does and doesn't do
 
@@ -16,8 +17,10 @@ deserves a straight account of what it touches, so here it is.
   when seeding a new slot.
 - Create links inside `~/.claude-slots/*/` pointing back into `~/.claude` — symlinks,
   or directory junctions and hardlinks on a Windows box without Developer Mode.
-- Append one clearly delimited block to your shell rc file, and set `statusLine` in
-  `~/.claude/settings.json` (installer only).
+- Append one clearly delimited block to your shell rc file or PowerShell profile, and
+  set `statusLine` in `~/.claude/settings.json` (installer only).
+- On Windows, add the install directory to your **user** PATH environment variable
+  (installer only; `uninstall.ps1` removes it again). Never the machine-wide PATH.
 
 **Doesn't**
 
@@ -55,11 +58,12 @@ profile directory, which is normally you-only. If your home directory is on a sh
 looser permissions, that applies to Claude Code's own credential file just as much as to
 ccp's copies.
 
-**A shared install directory.** `install.sh --shared` writes to `/Users/Shared/ccp` by
-default. Files land owned by the installing user with mode 755, so other local users
-can execute but not modify them. `/Users/Shared` is world-writable with the sticky bit,
-which means another local user could add files there but not alter yours. If that
-matters in your setup, install per-user instead — it's the default.
+**A shared install directory.** `install.sh --shared` writes to `/Users/Shared/ccp` on
+macOS, or a directory you name on Linux. Files land owned by the installing user with
+mode 755, so other local users can execute but not modify them. `/Users/Shared` is
+world-writable with the sticky bit, which means another local user could add files there
+but not alter yours. If that matters in your setup, install per-user instead — it's the
+default, and it is the only mode `install.ps1` offers on Windows.
 
 **Blast radius of a bug.** The worst realistic outcome is a corrupted live credential,
 which logs you out. `ccp` guards against it: every write is read back and
@@ -68,11 +72,11 @@ before any write happens. Recovery is a normal `/login`.
 
 **Interrupted swap.** A swap parks before it loads, in that order deliberately. If it
 dies between the two steps, the outgoing account's credential is already safely in its
-slot and the live entry is untouched — re-run the swap. There is no window where a
+slot and the live store is untouched — re-run the swap. There is no window where a
 credential exists in neither place.
 
 **Rotation.** Refresh tokens rotate on use. `ccp` keeps exactly one authoritative copy
-of any given grant: the live entry while that account is live, the slot's entry
+of any given grant: the live store while that account is live, the slot's store
 otherwise. The commands that could break this rule (`pin`, `logout`, `rm` against the
 live slot) refuse to run.
 

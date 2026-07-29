@@ -75,7 +75,7 @@ watches for.
   writing a real credential into N's own store — without disturbing the live one. It
   doubles as the parking space for that account's credential and identity.
 - `~/.claude-profiles/` holds `ccp`'s own state: one `slotN.dir` file per slot and a
-  `live` file naming the slot currently loaded into the live entry.
+  `live` file naming the slot currently loaded into the live store.
 
 `ccp login 2` therefore has zero effect on your running sessions, which is what makes
 it safe to set up a second account in the middle of a working day.
@@ -84,24 +84,24 @@ it safe to set up a second account in the middle of a working day.
 
 `ccp swap 2`, with slot 1 live:
 
-1. Read the live entry. Write it into **slot 1's** entry. Write the `oauthAccount`
+1. Read the live store. Write it into **slot 1's** store. Write the `oauthAccount`
    block from `~/.claude.json` into `~/.claude-slots/1/.claude.json`.
-2. Read slot 2's entry. Backdate `expiresAt` on that copy. Write it into the live
-   entry. Restore slot 2's identity block into `~/.claude.json`.
+2. Read slot 2's store. Backdate `expiresAt` on that copy. Write it into the live
+   store. Restore slot 2's identity block into `~/.claude.json`.
 3. Record `live = 2`.
 
 Every write is read back and compared before the step is considered done, and a blob
 that doesn't parse as JSON containing an `accessToken` is refused outright — a bad
-write to the live entry would break every open session at once.
+write to the live store would break every open session at once.
 
 ### Why park before load
 
 Refresh tokens rotate: when a session refreshes, it gets a *new* refresh token and the
 old one stops working. While slot 1 is live, all that rotation happens in the live
-entry — slot 1's parked copy goes stale the moment the first refresh lands.
+store — slot 1's parked copy goes stale the moment the first refresh lands.
 
 So the parked copy is only ever trusted for a slot that is **not** live, and the very
-first thing a swap does is refresh the outgoing slot's parked copy from the live entry.
+first thing a swap does is refresh the outgoing slot's parked copy from the live store.
 The parked credential you load tomorrow is the one that was valid when you swapped
 away, not a stale snapshot from whenever you logged in.
 
@@ -147,9 +147,11 @@ A slot directory is almost entirely links back into `~/.claude`. Everything is s
 except account identity and per-process state:
 
 **Private per slot** — `.claude.json` (account identity and subscription caches),
-`sessions/`, `shell-snapshots/`, `session-env/`, `ide/`, `daemon/`, `statsig/`,
-`cache/`, `paste-cache/`, `backups/`, `metrics/`, `debug/`, `uploads/`,
-`history.jsonl`, the MCP and policy caches, and anything ending in `.log` or `.lock`.
+`.credentials.json` (with the file backend this *is* the credential, so linking it would
+defeat the whole design), `sessions/`, `shell-snapshots/`, `session-env/`, `ide/`,
+`daemon/`, `statsig/`, `cache/`, `paste-cache/`, `backups/`, `metrics/`, `debug/`,
+`uploads/`, `history.jsonl`, the MCP and policy caches, and anything ending in `.log`
+or `.lock`.
 
 **Shared** — everything else, notably `commands/`, `agents/`, `skills/`, `plugins/`,
 `settings.json`, `CLAUDE.md`, and `projects/`.
@@ -165,9 +167,9 @@ owns.
 ~/.claude-profiles/
   slot1.dir        absolute path of slot 1's config dir
   slot2.dir
-  live             slot number currently loaded into the live entry
+  live             slot number currently loaded into the live store
 ~/.claude-slots/
-  1/  2/  3/       per-slot config dirs (mostly symlinks + .claude.json)
+  1/  2/  3/       per-slot config dirs (mostly links + .claude.json)
 ```
 
 Slot numbers are stable and never renumbered. `ccp rm 3` without `--purge` leaves the

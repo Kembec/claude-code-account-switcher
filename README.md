@@ -117,8 +117,10 @@ ccp swap 2           # switch the account for EVERY open session
 
 - **Plain `claude`** uses the live credential. This is what makes one swap reach every
   session, so it's the default and you shouldn't override it.
-- **`ccp pin 2`** (or `CCP=2 claude`) nails one process to slot 2. Swaps don't touch
-  it. Use this when you want two accounts running side by side.
+- **`ccp pin 2`** nails one process to slot 2. Swaps don't touch it. Use this when you
+  want two accounts running side by side. The shell function honours the same thing via
+  an environment variable: `CCP=2 claude` on macOS and Linux, `$env:CCP=2; claude` in
+  PowerShell.
 
 `ccp pin`, `ccp logout` and `ccp rm` refuse to operate on the live slot, because two
 families of processes refreshing the same credential from different stores is how
@@ -130,9 +132,9 @@ The installer sets a statusline so you can always see which account a session is
 with one colour per slot:
 
 ```
- slot1 · me@work.example · my-project · Opus 4.6
- slot2 · me@personal.example · my-project · Opus 4.6
- slot3 pin · me@other.example · scratch · Sonnet 4.6
+ slot1 · me@work.example · my-project · Opus 5
+ slot2 · me@personal.example · my-project · Opus 5
+ slot3 pin · me@other.example · scratch · Sonnet 5
 ```
 
 It reads the live slot from state, so **after a swap every open session shows the new
@@ -180,8 +182,8 @@ your accounts permit what you're doing is between you and their terms of service
 check [Anthropic's terms](https://www.anthropic.com/legal/consumer-terms) and, if the
 account belongs to an employer, your own organisation's policy.
 
-`ccp` never transmits credentials anywhere. Everything stays in your login keychain
-on your machine.
+`ccp` never transmits credentials anywhere. Everything stays in the store Claude Code
+already uses on your machine — your login keychain on macOS, a mode-600 file elsewhere.
 
 ## What's verified, and what isn't
 
@@ -246,14 +248,17 @@ ccp doctor
 
 **A swap didn't seem to land.** Send any message in the open session to make it talk
 to the API, then check `ccp live`. If it still hasn't moved, `ccp doctor` will show
-whether the live entry actually holds the new token.
+whether the live store actually holds the new token.
 
 **A slot lost its login.** `ccp login <n>` again. Parked credentials only go stale if
 something outside `ccp` overwrote a credential store.
 
-**Removing it.** `sh uninstall.sh` takes out the command, the shell block and the
-statusline. It never touches the live entry, so you stay signed in to whatever account
-is live. `--purge` also deletes the slot directories and parked credentials.
+**Removing it.** `sh uninstall.sh` on macOS and Linux, or
+`pwsh -ExecutionPolicy Bypass -File .\uninstall.ps1` on Windows. Either takes out the
+command, the shell profile block and the statusline — and the PATH entry on Windows.
+Neither touches the live credential, so you stay signed in to whatever account is live.
+Add `--purge` (`-Purge` in PowerShell) to also delete the slot directories and their
+parked credentials.
 
 ## License
 

@@ -1,5 +1,17 @@
 # Changelog
 
+## 1.1.1
+
+- **`uninstall.ps1`** — 1.1.0 shipped a Windows installer with no uninstaller, and the
+  README pointed Windows users at `uninstall.sh`. It removes the command, the profile
+  block, the statusline and the user PATH entry, and like its shell counterpart never
+  touches the live credential. `-Purge` clears parked credentials through
+  `ccp rm --purge`.
+- Docs: several statements were still macOS-only after 1.1.0 — most importantly a claim
+  that credentials never touch the disk, which is false where the credential *is* a
+  file. Also documents that `.credentials.json` is deliberately never shared into a
+  slot, since with the file backend that file is the credential.
+
 ## 1.1.0
 
 Cross-platform support.
