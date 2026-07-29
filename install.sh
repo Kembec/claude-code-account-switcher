@@ -75,11 +75,9 @@ case "${SHELL##*/}" in
 esac
 touch "$RC"
 
-if grep -qF "$MARK" "$RC"; then
-  echo "    $RC: ccp block already present, left untouched"
-else
-  cat >> "$RC" <<BLOCK
-
+BLOCK_FILE=$(mktemp)
+trap 'rm -f "$BLOCK_FILE"' EXIT
+cat > "$BLOCK_FILE" <<BLOCK
 # >>> ccp - Claude Code account slots >>>
 case ":\$PATH:" in *":$BINDIR:"*) ;; *) export PATH="$BINDIR:\$PATH" ;; esac
 # Plain \`claude\` always runs on the live credential (~/.claude); that is what lets
@@ -95,8 +93,32 @@ claude() {
 }
 # <<< ccp <<<
 BLOCK
-  echo "    $RC: ccp block added"
-fi
+
+# An existing block is REPLACED, not left alone. Leaving a stale block behind is how a
+# moved or renamed install directory silently breaks a user: their PATH and statusline
+# keep pointing at a directory that no longer exists.
+python3 - "$RC" "$BLOCK_FILE" <<'PY'
+import pathlib, sys
+rc, want = pathlib.Path(sys.argv[1]), pathlib.Path(sys.argv[2]).read_text().rstrip("\n")
+OPEN, CLOSE = "# >>> ccp", "# <<< ccp <<<"
+lines, kept, block, skip = rc.read_text().splitlines(), [], [], False
+for ln in lines:
+    if not skip and ln.startswith(OPEN):
+        skip = True
+    if skip:
+        block.append(ln)
+        if ln.rstrip() == CLOSE:
+            skip = False
+        continue
+    kept.append(ln)
+existing = "\n".join(block).rstrip("\n")
+if existing == want:
+    print(f"    {rc}: ccp block already current")
+    raise SystemExit(0)
+body = "\n".join(kept).rstrip("\n")
+rc.write_text((body + "\n" if body else "") + "\n" + want + "\n")
+print(f"    {rc}: ccp block " + ("updated" if existing else "added"))
+PY
 
 # --- statusline ------------------------------------------------------------- #
 python3 - "$BINDIR" <<'PY'

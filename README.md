@@ -75,6 +75,13 @@ credential file lives under each user's home — so **every user keeps their own
 and their own logins**. Credentials never cross user accounts; that's an OS boundary,
 not a `ccp` choice.
 
+One caveat learned the hard way: the installer writes the **absolute** install path into
+each user's shell profile and `settings.json`. If you later move or rename a shared
+install directory, every user who pointed at it loses both the command and the
+statusline until they re-run `install.sh`. Re-running it replaces a stale block rather
+than leaving it in place, so the fix is one command per user — but nothing warns them
+first.
+
 </details>
 
 <details>

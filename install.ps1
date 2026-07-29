@@ -82,11 +82,10 @@ $profilePath = $PROFILE.CurrentUserAllHosts
 New-Item -ItemType Directory -Force -Path (Split-Path -Parent $profilePath) | Out-Null
 if (-not (Test-Path $profilePath)) { New-Item -ItemType File -Path $profilePath | Out-Null }
 
-if ((Get-Content $profilePath -Raw -ErrorAction SilentlyContinue) -match [regex]::Escape($mark)) {
-    Write-Host "    $profilePath : ccp block already present, left untouched"
-} else {
-    Add-Content $profilePath @'
-
+# An existing block is REPLACED, not left alone. Leaving a stale block behind is how a
+# moved or renamed install directory silently breaks a user.
+$markClose = '# <<< ccp <<<'
+$want = @'
 # >>> ccp - Claude Code account slots >>>
 function claude {
     $exe = (Get-Command claude.exe, claude.cmd -CommandType Application -ErrorAction SilentlyContinue |
@@ -110,7 +109,26 @@ function claude {
 }
 # <<< ccp <<<
 '@
-    Write-Host "    $profilePath : ccp block added"
+
+$kept = [System.Collections.Generic.List[string]]::new()
+$block = [System.Collections.Generic.List[string]]::new()
+$skip = $false
+foreach ($ln in (Get-Content $profilePath)) {
+    if (-not $skip -and $ln.TrimStart().StartsWith($mark)) { $skip = $true }
+    if ($skip) {
+        $block.Add($ln)
+        if ($ln.Trim() -eq $markClose) { $skip = $false }
+        continue
+    }
+    $kept.Add($ln)
+}
+$existing = ($block -join "`n").Trim()
+if ($existing -eq $want.Trim()) {
+    Write-Host "    $profilePath : ccp block already current"
+} else {
+    $body = ($kept -join "`n").TrimEnd()
+    Set-Content -Path $profilePath -Value ($body + "`n`n" + $want)
+    Write-Host "    $profilePath : ccp block $(if ($existing) { 'updated' } else { 'added' })"
 }
 
 # --- statusline ------------------------------------------------------------- #

@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.1.2
+
+- **Both installers now replace an existing ccp block instead of skipping it.** The old
+  behaviour left a stale block in place, so moving or renaming a shared install
+  directory silently broke every user pointing at it: their `PATH` and statusline kept
+  referencing a directory that no longer existed, with no warning. Re-running the
+  installer now repairs it. Verified against a disposable HOME on both shells — one
+  block, surrounding lines untouched, idempotent on a second run.
+- README documents that caveat, since nothing warns a user whose shared install moved.
+
 ## 1.1.1
 
 - **`uninstall.ps1`** — 1.1.0 shipped a Windows installer with no uninstaller, and the
