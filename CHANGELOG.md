@@ -1,5 +1,17 @@
 # Changelog
 
+## 1.1.3
+
+- **`ccp` and `install.sh` now refuse to run under `sudo`.** `sudo` leaves `HOME`
+  pointing at the calling user but sets `USER=root`, so the config directory and the
+  keychain account came from different users. The symptom was quiet and wrong rather
+  than loud: `ccp ls` reported a slot as having no login while its credential sat there
+  untouched, and a write would have landed under root's account where no session reads.
+  Hit for real on a multi-user Mac. Five new checks cover it.
+- `ccp doctor` prints the keychain account it is using and warns when that account does
+  not match the home directory, so the general form of the mismatch is visible.
+- README documents it under Troubleshooting.
+
 ## 1.1.2
 
 - **Both installers now replace an existing ccp block instead of skipping it.** The old

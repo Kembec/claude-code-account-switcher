@@ -260,6 +260,11 @@ whether the live store actually holds the new token.
 **A slot lost its login.** `ccp login <n>` again. Parked credentials only go stale if
 something outside `ccp` overwrote a credential store.
 
+**Never use `sudo`.** `sudo` leaves `HOME` pointing at you but sets `USER=root`, so the
+config directory and the credential store would come from different users: `ccp` would
+report a slot as having no login when it does, and a write would land somewhere no
+session reads. Both `ccp` and the installer refuse to run under `sudo` for that reason.
+
 **Removing it.** `sh uninstall.sh` on macOS and Linux, or
 `pwsh -ExecutionPolicy Bypass -File .\uninstall.ps1` on Windows. Either takes out the
 command, the shell profile block and the statusline — and the PATH entry on Windows.

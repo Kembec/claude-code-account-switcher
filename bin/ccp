@@ -38,7 +38,7 @@ import unicodedata
 from hashlib import sha256
 from pathlib import Path
 
-VERSION = "1.1.2"
+VERSION = "1.1.3"
 
 HOME = Path.home()
 LIVE_DIR = HOME / ".claude"             # config dir every plain `claude` uses
@@ -78,6 +78,23 @@ def die(msg: str) -> None:
 def short(p: Path) -> str:
     s = str(p)
     return "~" + s[len(str(HOME)):] if s.startswith(str(HOME)) else s
+
+
+def refuse_sudo() -> None:
+    """Refuse to run under sudo, because sudo splits identity in half.
+
+    The config dir comes from HOME, which sudo leaves pointing at the calling user, but
+    the keychain account comes from USER, which sudo sets to root. ccp would then look
+    for credentials under the wrong account and cheerfully report that a slot has no
+    login when it does — or, worse, write one where no session will ever find it. With
+    the file backend it would leave root-owned files in your home instead.
+    """
+    if not os.environ.get("SUDO_USER"):
+        return
+    die("do not run ccp under sudo.\n"
+        f"  sudo sets USER=root while HOME stays {HOME}, so the credential store "
+        f"ccp picks would not be the one your sessions read.\n"
+        f"  Run it as yourself: ccp {' '.join(sys.argv[1:])}")
 
 
 # --------------------------------------------------------------------------- #
@@ -660,7 +677,12 @@ def cmd_doctor(_a: list[str]) -> None:
 
     if backend() == "keychain":
         r = subprocess.run(["security", "list-keychains"], capture_output=True)
-        line(r.returncode == 0, "login keychain reachable")
+        acct = KeychainStore._account()
+        line(r.returncode == 0, "login keychain reachable", f"account {acct}")
+        if acct != HOME.name:
+            print(f"    {C['y']}! keychain account '{acct}' does not match the home "
+                  f"directory '{HOME.name}' - credentials may be looked up in the "
+                  f"wrong place{C['0']}")
     else:
         line(LIVE_DIR.is_dir(), "live config dir exists", short(LIVE_DIR))
 
@@ -713,6 +735,7 @@ It always parks the outgoing credential first, so rotating refresh tokens never
 diverge. `ccp pin` is the opposite: a process nailed to one slot that swaps ignore.
 
 Backend: macOS login keychain; .credentials.json on Linux and Windows.
+Never run ccp with sudo: it would use root's credential store, not yours.
 Not affiliated with Anthropic. Use only with accounts you own.{C['0']}"""
 
 
@@ -739,6 +762,7 @@ def main() -> None:
     fn = CMDS.get(argv[0])
     if not fn:
         die(f"unknown command '{argv[0]}' - try `ccp --help`")
+    refuse_sudo()
     fn(argv[1:])
 
 

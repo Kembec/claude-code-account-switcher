@@ -21,6 +21,16 @@ MODE=link
 BINDIR="$HOME/.local/bin"
 OS=$(uname -s)
 
+# sudo splits identity: HOME stays yours but USER becomes root, so ccp would end up
+# using root's credential store, and anything created lands root-owned in your home.
+if [ -n "${SUDO_USER:-}" ]; then
+  echo "!! do not run this with sudo." >&2
+  echo "   sudo sets USER=root while HOME stays \$HOME, so ccp would use root's" >&2
+  echo "   credential store instead of yours, and new files would be root-owned." >&2
+  echo "   Run it as yourself: sh $0 $*" >&2
+  exit 1
+fi
+
 while [ $# -gt 0 ]; do
   case "$1" in
     --copy)   MODE=copy ;;

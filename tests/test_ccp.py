@@ -114,11 +114,13 @@ class Sandbox:
 
     # -- running ccp -------------------------------------------------------- #
 
-    def run(self, *args: str) -> subprocess.CompletedProcess:
+    def run(self, *args: str, **envextra: str) -> subprocess.CompletedProcess:
         env = dict(os.environ)
         env.update(HOME=str(self.home), USERPROFILE=str(self.home),
                    CCP_BACKEND="file", NO_COLOR="1")
         env.pop("CLAUDE_CONFIG_DIR", None)
+        env.pop("SUDO_USER", None)
+        env.update(envextra)
         return subprocess.run([sys.executable, str(CCP), *args],
                               capture_output=True, text=True, env=env)
 
@@ -300,6 +302,16 @@ def test_bad_input(sb: Sandbox) -> None:
 
     r = sb.run("--version")
     check(r.returncode == 0 and r.stdout.startswith("ccp "), "--version works")
+
+    section("running under sudo is refused, not half-done")
+    # sudo leaves HOME alone but sets USER=root, so the config dir and the credential
+    # store would come from different users. Every command must refuse.
+    for cmd in (("ls",), ("swap", "1"), ("init",), ("doctor",)):
+        r = sb.run(*cmd, SUDO_USER="someone")
+        ok = r.returncode != 0 and "under sudo" in r.stderr
+        check(ok, f"`ccp {' '.join(cmd)}` refuses under sudo")
+    r = sb.run("--version", SUDO_USER="someone")
+    check(r.returncode == 0, "--version still works under sudo (reads nothing)")
 
     env_bad = sb.run("nonsense")
     check(env_bad.returncode != 0 and "unknown command" in env_bad.stderr,
