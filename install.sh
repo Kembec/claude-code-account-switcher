@@ -1,15 +1,17 @@
 #!/bin/sh
-# Install ccp for the user running this script. Idempotent — safe to re-run.
+# Install ccp for the user running this script. Idempotent - safe to re-run.
+# macOS and Linux; on Windows use install.ps1.
 #
 #   sh install.sh                 # install into ~/.local/bin (symlinks to this repo)
 #   sh install.sh --copy          # copy the files instead of symlinking
-#   sh install.sh --shared        # install into /Users/Shared/ccp, for multi-user Macs
-#   sh install.sh --shared DIR    # ...or into DIR
+#   sh install.sh --shared        # macOS: /Users/Shared/ccp, for multi-user machines
+#   sh install.sh --shared DIR    # ...or into DIR (required on Linux)
 #
-# On a Mac with several user accounts, run it once with --shared from any account,
-# then run it again (no flags needed) from each other account: macOS gives every user
-# their own login keychain, so every user keeps their own slots and their own logins.
-# Credentials never cross user accounts — that is an OS boundary, not a ccp choice.
+# On a machine with several user accounts, run it once with --shared from any account,
+# then run it again (no flags needed) from each other account: credentials are stored
+# per user - macOS gives every user their own login keychain, and on Linux the
+# credential file lives under each user's home. So every user keeps their own slots and
+# their own logins, and credentials never cross accounts.
 
 set -e
 
@@ -17,21 +19,30 @@ REPO=$(cd "$(dirname "$0")" && pwd)
 MARK='# >>> ccp'
 MODE=link
 BINDIR="$HOME/.local/bin"
+OS=$(uname -s)
 
 while [ $# -gt 0 ]; do
   case "$1" in
     --copy)   MODE=copy ;;
     --shared) MODE=copy
               if [ -n "$2" ] && [ "${2#-}" = "$2" ]; then BINDIR="$2"; shift
-              else BINDIR="/Users/Shared/ccp"; fi ;;
-    -h|--help) sed -n '2,14p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+              elif [ "$OS" = Darwin ]; then BINDIR="/Users/Shared/ccp"
+              else echo "!! --shared needs a directory on $OS, e.g. --shared /opt/ccp" >&2
+                   exit 1; fi ;;
+    -h|--help) sed -n '2,16p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "unknown option: $1" >&2; exit 1 ;;
   esac
   shift
 done
 
-[ "$(uname -s)" = "Darwin" ] || {
-  echo "!! macOS only: ccp keeps credentials in the login keychain." >&2
+case "$OS" in
+  Darwin) STORE="login keychain" ;;
+  Linux)  STORE="~/.claude/.credentials.json" ;;
+  *) echo "!! unsupported OS: $OS (Windows: use install.ps1)" >&2; exit 1 ;;
+esac
+
+command -v python3 >/dev/null 2>&1 || {
+  echo "!! python3 is not on PATH. Install it and re-run." >&2
   exit 1
 }
 
@@ -41,9 +52,10 @@ command -v claude >/dev/null 2>&1 || {
   exit 1
 }
 
-echo "==> installing ccp for $(id -un)"
-echo "    source: $REPO"
-echo "    bindir: $BINDIR"
+echo "==> installing ccp for $(id -un) on $OS"
+echo "    source:      $REPO"
+echo "    bindir:      $BINDIR"
+echo "    credentials: $STORE"
 
 mkdir -p "$BINDIR"
 for f in ccp ccp-statusline.py; do
@@ -68,7 +80,7 @@ if grep -qF "$MARK" "$RC"; then
 else
   cat >> "$RC" <<BLOCK
 
-# >>> ccp — Claude Code account slots >>>
+# >>> ccp - Claude Code account slots >>>
 case ":\$PATH:" in *":$BINDIR:"*) ;; *) export PATH="$BINDIR:\$PATH" ;; esac
 # Plain \`claude\` always runs on the live credential (~/.claude); that is what lets
 # one \`ccp swap\` change the account for every open session. CCP=2 pins one run.
@@ -99,14 +111,12 @@ except (OSError, ValueError):
 want = {"type": "command", "command": f"{bindir}/ccp-statusline.py", "padding": 0}
 if d.get("statusLine") == want:
     print("    settings.json: statusLine already configured")
-elif "statusLine" in d and d["statusLine"]:
-    d["statusLine"] = want
-    p.write_text(json.dumps(d, indent=2, ensure_ascii=False) + "\n")
-    print("    settings.json: statusLine replaced (previous one was overwritten)")
 else:
+    replaced = bool(d.get("statusLine"))
     d["statusLine"] = want
     p.write_text(json.dumps(d, indent=2, ensure_ascii=False) + "\n")
-    print("    settings.json: statusLine configured")
+    print("    settings.json: statusLine "
+          + ("replaced (previous one was overwritten)" if replaced else "configured"))
 PY
 
 # --- park the current login ------------------------------------------------- #

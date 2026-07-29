@@ -1,12 +1,12 @@
 #!/bin/sh
-# Remove ccp for the user running this script.
+# Remove ccp for the user running this script. macOS and Linux.
 #
 #   sh uninstall.sh            # remove the command, shell block and statusline
 #   sh uninstall.sh --purge    # ...and delete slot dirs + parked credentials
 #
-# Neither mode ever touches the LIVE keychain entry, so you stay logged into
-# whichever account is live right now. --purge only deletes the parked copies, which
-# means the accounts in the other slots will need a normal /login again.
+# Neither mode ever touches the LIVE credential, so you stay signed in to whichever
+# account is live right now. --purge only deletes the parked copies, which means the
+# accounts in the other slots will need a normal /login again.
 
 set -e
 
@@ -20,18 +20,30 @@ case "${SHELL##*/}" in
   *)    RC="$HOME/.zshrc" ;;
 esac
 
+CCP=$(command -v ccp 2>/dev/null || true)
+
 echo "==> removing ccp for $(id -un)"
 
-# Which account will you be left on?
-if [ -r "$HOME/.claude-profiles/live" ]; then
-  LIVE=$(cat "$HOME/.claude-profiles/live")
-  EMAIL=$(python3 -c "
-import json,pathlib,sys
-p=pathlib.Path.home()/'.claude-slots'/sys.argv[1]/'.claude.json'
-try: print((json.loads(p.read_text()).get('oauthAccount') or {}).get('emailAddress') or '?')
-except Exception: print('?')
-" "$LIVE" 2>/dev/null || echo '?')
-  echo "    live account stays signed in: slot$LIVE ($EMAIL)"
+if [ -n "$CCP" ]; then
+  LIVE=$("$CCP" live 2>/dev/null || true)
+  [ -n "$LIVE" ] && echo "    live account stays signed in: $LIVE"
+fi
+
+# --- optional purge (before the command goes away, so ccp can do it safely) -- #
+if [ "$PURGE" = yes ]; then
+  if [ -n "$CCP" ]; then
+    # `ccp rm --purge` refuses the live slot, which is exactly the guarantee we want.
+    for f in "$HOME"/.claude-profiles/slot*.dir; do
+      [ -e "$f" ] || continue
+      n=$(basename "$f" .dir | sed 's/^slot//')
+      "$CCP" rm "$n" --purge >/dev/null 2>&1 && echo "    slot$n purged" || true
+    done
+  else
+    echo "    ! ccp not on PATH; deleting slot dirs without clearing keychain items"
+  fi
+  rm -rf "$HOME/.claude-slots" "$HOME/.claude-profiles"
+  echo "    removed ~/.claude-slots and ~/.claude-profiles"
+  echo "    NOTE: the live credential was left intact - you are still signed in."
 fi
 
 # --- shell block ------------------------------------------------------------ #
@@ -39,8 +51,8 @@ if [ -f "$RC" ] && grep -qF "$MARK_OPEN" "$RC"; then
   python3 - "$RC" "$MARK_OPEN" "$MARK_CLOSE" <<'PY'
 import sys, pathlib
 rc, open_m, close_m = pathlib.Path(sys.argv[1]), sys.argv[2], sys.argv[3]
-lines, out, skip = rc.read_text().splitlines(True), [], False
-for ln in lines:
+out, skip = [], False
+for ln in rc.read_text().splitlines(True):
     if not skip and ln.startswith(open_m):
         skip = True
         continue
@@ -64,8 +76,7 @@ try:
     d = json.loads(p.read_text())
 except (OSError, ValueError):
     raise SystemExit(0)
-sl = d.get("statusLine") or {}
-if "ccp-statusline" in str(sl.get("command", "")):
+if "ccp-statusline" in str((d.get("statusLine") or {}).get("command", "")):
     d.pop("statusLine", None)
     p.write_text(json.dumps(d, indent=2, ensure_ascii=False) + "\n")
     print("    settings.json: statusLine removed")
@@ -74,37 +85,13 @@ else:
 PY
 
 # --- the command itself ----------------------------------------------------- #
-for d in "$HOME/.local/bin" /Users/Shared/ccp /Users/Shared/claude-ccp; do
-  for f in ccp ccp-statusline.py statusline-slot.py; do
-    [ -e "$d/$f" ] || [ -L "$d/$f" ] || continue
+for d in "$HOME/.local/bin" /Users/Shared/ccp /Users/Shared/claude-ccp /opt/ccp; do
+  for f in ccp ccp.cmd ccp-statusline.py statusline-slot.py; do
+    { [ -e "$d/$f" ] || [ -L "$d/$f" ]; } || continue
     rm -f "$d/$f"
     echo "    removed $d/$f"
   done
 done
-
-# --- optional purge --------------------------------------------------------- #
-if [ "$PURGE" = yes ]; then
-  python3 - <<'PY'
-import json, os, re, subprocess, unicodedata
-from hashlib import sha256
-from pathlib import Path
-home, acct = Path.home(), os.environ.get("USER", "claude-code-user")
-reg = home / ".claude-profiles"
-for f in sorted(reg.glob("slot*.dir")):
-    m = re.match(r"^slot(\d+)$", f.stem)
-    if not m:
-        continue
-    d = home / ".claude-slots" / m.group(1)
-    svc = "Claude Code-credentials-" + sha256(
-        unicodedata.normalize("NFC", str(d)).encode()).hexdigest()[:8]
-    subprocess.run(["security", "delete-generic-password", "-a", acct, "-s", svc],
-                   capture_output=True)
-    print(f"    slot{m.group(1)}: parked credential deleted")
-PY
-  rm -rf "$HOME/.claude-slots" "$HOME/.claude-profiles"
-  echo "    removed ~/.claude-slots and ~/.claude-profiles"
-  echo "    NOTE: the live keychain entry was left intact — you are still signed in."
-fi
 
 cat <<EOF
 

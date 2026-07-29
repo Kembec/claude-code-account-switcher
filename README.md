@@ -19,9 +19,9 @@ $ ccp swap 2
 Your open sessions keep their full context. Nothing to exit, nothing to re-open, no
 browser round-trip. If you have six terminals going, all six follow the swap.
 
-> macOS only. Not affiliated with, endorsed by, or sponsored by Anthropic.
-> Intended for one person switching between accounts they personally own — see
-> [Intended use](#intended-use).
+> macOS, Linux and Windows. Not affiliated with, endorsed by, or sponsored by
+> Anthropic. Intended for one person switching between accounts they personally own —
+> see [Intended use](#intended-use).
 
 ---
 
@@ -33,13 +33,15 @@ and repeat every time you switch — plus a browser round-trip each way. Session
 had open keep running on the old account until their token happens to expire, so you
 can't tell which account a given window is billing.
 
-`ccp` parks each account's credential in its own keychain entry and swaps the one
-entry that live sessions actually read. One command, every session, and a statusline
+`ccp` parks each account's credential in its own store and swaps the one store that
+live sessions actually read. One command, every session, and a statusline
 that tells you which account you're on.
 
 ## Install
 
-Requires macOS, Python 3.9+ (system Python is fine), and Claude Code on your `PATH`.
+Requires Python 3.9+ (system Python is fine) and Claude Code on your `PATH`.
+
+**macOS / Linux**
 
 ```console
 git clone https://github.com/Kembec/claude-code-account-switcher.git
@@ -47,20 +49,44 @@ cd claude-code-account-switcher
 sh install.sh
 ```
 
-That symlinks `ccp` into `~/.local/bin`, adds a small block to your `~/.zshrc`,
+**Windows (PowerShell)**
+
+```powershell
+git clone https://github.com/Kembec/claude-code-account-switcher.git
+cd claude-code-account-switcher
+pwsh -ExecutionPolicy Bypass -File .\install.ps1
+```
+
+Either one places `ccp` on your `PATH`, adds a small block to your shell profile,
 configures the statusline, and parks the account you're already logged in with as
 `slot1`. Open a new terminal afterwards.
 
 <details>
-<summary>Multi-user Macs</summary>
+<summary>Machines with several user accounts</summary>
 
 ```console
-sh install.sh --shared          # → /Users/Shared/ccp
+sh install.sh --shared              # macOS: /Users/Shared/ccp
+sh install.sh --shared /opt/ccp     # Linux: pass the directory
 ```
 
-Then run `sh install.sh` once from each other macOS account. Every user gets their
-own login keychain, so **every user keeps their own slots and their own logins**.
-Credentials never cross user accounts; that's an OS boundary, not a `ccp` choice.
+Then run `sh install.sh` once from each other account. Credentials are stored per
+user — macOS gives every user their own login keychain, and on Linux and Windows the
+credential file lives under each user's home — so **every user keeps their own slots
+and their own logins**. Credentials never cross user accounts; that's an OS boundary,
+not a `ccp` choice.
+
+</details>
+
+<details>
+<summary>Credential backends</summary>
+
+| Platform | Where the credential lives |
+| --- | --- |
+| macOS | login keychain, via `/usr/bin/security` |
+| Linux, Windows | `<config dir>/.credentials.json`, mode 600 |
+
+`ccp` picks the right one automatically. `CCP_BACKEND=keychain\|file` overrides it,
+which is mainly how the test suite exercises the file backend on a Mac.
 
 </details>
 
@@ -81,7 +107,7 @@ ccp swap 2           # switch the account for EVERY open session
 | `ccp logout <n>` | Delete slot `n`'s parked credential |
 | `ccp pin <n> …` | Run a `claude` nailed to slot `n`, immune to swaps |
 | `ccp live` | Which slot is live right now |
-| `ccp sync [n]` | Rebuild the shared symlinks (idempotent) |
+| `ccp sync [n]` | Rebuild the shared links (idempotent) |
 | `ccp rm <n>` | Unregister a slot (`--purge` also deletes dir + credential) |
 | `ccp doctor` | Self-check the environment and state |
 
@@ -95,7 +121,7 @@ ccp swap 2           # switch the account for EVERY open session
   it. Use this when you want two accounts running side by side.
 
 `ccp pin`, `ccp logout` and `ccp rm` refuse to operate on the live slot, because two
-families of processes refreshing the same credential from different entries is how
+families of processes refreshing the same credential from different stores is how
 you get a diverged refresh token.
 
 ### Statusline
@@ -115,18 +141,19 @@ account**. Already-running sessions won't display it until you restart them once
 
 ## How it works
 
-Claude Code derives its keychain item name from the config directory: the item is
-`Claude Code-credentials` when `CLAUDE_CONFIG_DIR` is unset, and gets a suffix
-derived from that directory's path when it is set. So pointing `CLAUDE_CONFIG_DIR` at
-a per-slot directory gives each account a private credential that can't clobber the
-others — that's how `ccp login` parks an account without disturbing your live session.
+Claude Code scopes its credential to the config directory. On macOS the keychain item
+is `Claude Code-credentials` when `CLAUDE_CONFIG_DIR` is unset and gets a suffix
+derived from that directory's path when it is set; on Linux and Windows the credential
+is simply a file inside the config directory. Either way, pointing
+`CLAUDE_CONFIG_DIR` at a per-slot directory gives each account a private credential
+that can't clobber the others — that's how `ccp login` parks an account without
+disturbing your live session.
 
-Every plain `claude` runs in `~/.claude` and reads the one unsuffixed entry. `ccp
-swap` copies the live entry's contents back into the outgoing slot's entry, then
-copies the incoming slot's entry into the live one. Claude Code watches for
-credential changes it didn't make — that's how concurrent instances stay consistent
-when one of them refreshes a token — so live sessions pick the new credential up on
-their own.
+Every plain `claude` runs in `~/.claude` and reads the one shared credential. `ccp
+swap` copies the live credential back into the outgoing slot's store, then copies the
+incoming slot's store into the live one. Claude Code watches for credential changes it
+didn't make — that's how concurrent instances stay consistent when one of them
+refreshes a token — so live sessions pick the new credential up on their own.
 
 Access tokens last about eight hours and a running session holds one in memory, so a
 swap would otherwise take hours to land. `ccp` backdates `expiresAt` on the credential
@@ -134,7 +161,7 @@ it installs: the next token check decides a refresh is due, refreshes with the
 incoming account's refresh token, and adopts that identity. Nothing is revoked.
 
 Slots share your whole Claude Code setup — `commands/`, `agents/`, `skills/`,
-`plugins/`, `settings.json`, and `projects/` — through symlinks, so there's one
+`plugins/`, `settings.json`, and `projects/` — through links, so there's one
 toolbox and one transcript history regardless of which account is live.
 
 Full detail, including the reasoning behind the parking order, is in
@@ -156,24 +183,58 @@ account belongs to an employer, your own organisation's policy.
 `ccp` never transmits credentials anywhere. Everything stays in your login keychain
 on your machine.
 
+## What's verified, and what isn't
+
+Being straight about this matters more than sounding confident, because the tool moves
+credentials around.
+
+**Verified on real hardware:** the macOS keychain path, end to end. Live swaps in both
+directions against two real accounts, confirmed by watching the credential state
+rather than by trusting output — after a swap the live access token was one neither
+slot had held, produced by a refresh with the incoming account's refresh token, and
+open sessions carried on without a restart.
+
+**Verified by test suite:** all the logic — parking order, rotation survival, the
+backdating, the guards, slot resolution, refusal to write a malformed credential —
+plus the file backend that Linux and Windows use. `tests/test_ccp.py` runs the real CLI
+against a throwaway `HOME` and passes on macOS too, so the non-macOS credential store
+is exercised on every run.
+
+```console
+python3 tests/test_ccp.py      # 53 checks, no network, touches nothing real
+```
+
+**Verified under PowerShell:** `install.ps1` parses clean on pwsh 7.6.4, the block it
+injects into your profile parses on its own, every cmdlet and parameter it uses exists,
+and the `claude` function it defines restores a pre-existing `CLAUDE_CONFIG_DIR` instead
+of leaking one.
+
+**Not verified:** Linux and Windows on actual Linux and Windows machines. The credential
+location and format there come from the client's own behaviour, and the logic and the
+installer are covered by the checks above, but nobody has yet run the whole thing on
+those operating systems. If you do, an issue either way is genuinely useful.
+
 ## Limitations
 
-- **macOS only.** Credentials go through `/usr/bin/security`. On Linux, Claude Code
-  stores them in `~/.claude/.credentials.json` instead; a file backend would be
-  straightforward but isn't implemented, and shipping code I can't test seemed worse
-  than saying so.
-- **It rides on undocumented internals.** The keychain naming scheme and credential
-  layout were determined by observing Claude Code's own behaviour, verified against
-  **2.1.220**. A future release could change either. `ccp doctor` tells you whether
-  the assumptions still hold; if they don't, uninstalling leaves you with a normal,
-  working Claude Code login.
-- **Swaps aren't instantaneous.** They land on each session's next token check, not
-  the same millisecond. Seconds to minutes in practice.
+- **It rides on undocumented internals.** The credential naming scheme and layout were
+  determined by observing Claude Code's behaviour, verified against **2.1.220**. A
+  future release could change either. `ccp doctor` tells you whether the assumptions
+  still hold; if they don't, uninstalling leaves you with a normal, working login.
+- **Swaps aren't instantaneous.** They land on each session's next token check, not the
+  same millisecond. Seconds to minutes in practice.
 - **One live account at a time** across plain sessions. If you want two accounts at
   once, use `ccp pin`.
+- **Windows symlinks need Developer Mode.** Without it, `ccp` shares slot content using
+  directory junctions and file hardlinks instead, which need no privilege. `ccp sync`
+  says so if anything couldn't be linked; the slot still works, it just won't share
+  those items.
 - Per-slot `.claude.json` keeps its own account identity, but a session that was
   already running may show the previous account in `/status` until it refetches its
   profile. The statusline is the reliable indicator.
+- Don't judge a credential by running `claude -p` from inside another Claude Code
+  session — a nested client can inherit an OAuth token through a file descriptor and
+  authenticate even when the credential you meant to test is invalid. That trap cost
+  me a round of bad conclusions.
 
 ## Troubleshooting
 
@@ -181,15 +242,14 @@ on your machine.
 ccp doctor
 ```
 
-**"no live credential in the keychain"** — run `claude`, `/login` normally, then
-`ccp init`.
+**"no live credential found"** — run `claude`, `/login` normally, then `ccp init`.
 
 **A swap didn't seem to land.** Send any message in the open session to make it talk
 to the API, then check `ccp live`. If it still hasn't moved, `ccp doctor` will show
 whether the live entry actually holds the new token.
 
-**A slot lost its login.** `ccp login <n>` again. Parked credentials are only stale if
-something outside `ccp` overwrote a keychain entry.
+**A slot lost its login.** `ccp login <n>` again. Parked credentials only go stale if
+something outside `ccp` overwrote a credential store.
 
 **Removing it.** `sh uninstall.sh` takes out the command, the shell block and the
 statusline. It never touches the live entry, so you stay signed in to whatever account
