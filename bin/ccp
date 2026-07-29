@@ -1,0 +1,600 @@
+#!/usr/bin/env python3
+"""ccp — switch Claude Code accounts without logging out, live.
+
+MODEL: one live credential + N parking slots.
+
+    LIVE entry     ->  "Claude Code-credentials"                     (no CLAUDE_CONFIG_DIR)
+    slot N parked  ->  "Claude Code-credentials-<sha256(dir)[:8]>"    (dir = ~/.claude-slots/N)
+
+Every `claude` you start normally runs in ~/.claude and reads the LIVE keychain
+entry. That is why `ccp swap N` — which exchanges the contents of that one entry —
+switches the account for EVERY open session at once, without closing any of them.
+
+A swap ALWAYS parks before it loads: the credential that was live is copied back to
+its own slot together with whatever refreshes it accumulated. That way refresh
+tokens — which rotate — never diverge between the live entry and a slot's entry.
+
+INVARIANT: each keychain entry is read by exactly one family of processes.
+    LIVE     <- every plain `claude`
+    slot N   <- only `ccp login N` / `ccp pin N`, and only while N is not live
+`ccp pin`, `ccp logout` and `ccp rm` refuse to touch the live slot for that reason.
+
+macOS only: credentials live in the login keychain, reached through /usr/bin/security.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+import unicodedata
+from hashlib import sha256
+from pathlib import Path
+
+VERSION = "1.0.0"
+
+HOME = Path.home()
+LIVE_DIR = HOME / ".claude"             # runtime dir every plain `claude` uses
+SLOTS = HOME / ".claude-slots"          # slot N lives in SLOTS/N
+REG = HOME / ".claude-profiles"         # ccp state
+LIVE_STATE = REG / "live"               # which slot number is currently live
+LIVE_SERVICE = "Claude Code-credentials"
+
+# Per-slot private state: account identity plus ephemeral/per-process files.
+# Everything else in ~/.claude is shared into each slot as a symlink.
+PRIVATE = {
+    ".claude.json", ".credentials.json", "sessions",
+    "shell-snapshots", "session-env", "ide", "daemon", "statsig",
+    "cache", "paste-cache", "backups", "metrics", "debug", "uploads",
+    "history.jsonl", "policy-limits.json", "remote-settings.json",
+    "mcp-health-cache.json", "mcp-needs-auth-cache.json",
+    ".last-cleanup", ".last-update-result.json",
+    "daemon-auth-cooldown", "daemon-auth-status.json", ".storage-write",
+}
+PRIVATE_SUFFIX = (".log", ".lock")
+
+C = {"b": "\033[1m", "d": "\033[2m", "g": "\033[32m", "y": "\033[33m",
+     "r": "\033[31m", "c": "\033[36m", "0": "\033[0m"}
+if not sys.stdout.isatty():
+    C = {k: "" for k in C}
+
+
+def die(msg: str) -> None:
+    print(f"{C['r']}ccp: {msg}{C['0']}", file=sys.stderr)
+    raise SystemExit(1)
+
+
+def short(p: Path) -> str:
+    s = str(p)
+    return "~" + s[len(str(HOME)):] if s.startswith(str(HOME)) else s
+
+
+def require_macos() -> None:
+    if sys.platform != "darwin":
+        die("macOS only — ccp stores credentials in the login keychain.\n"
+            "  On Linux, Claude Code keeps them in ~/.claude/.credentials.json;\n"
+            "  a file backend is not implemented yet (see README).")
+
+
+# --------------------------------------------------------------------------- #
+# keychain
+# --------------------------------------------------------------------------- #
+
+def kc_account() -> str:
+    a = os.environ.get("USER") or "claude-code-user"
+    return a if re.fullmatch(r"[a-zA-Z0-9._-]+", a) else "claude-code-user"
+
+
+def service_of(n: int) -> str:
+    """Derive a slot's keychain service name the same way Claude Code does.
+
+    Claude Code names the item "Claude Code-credentials" when CLAUDE_CONFIG_DIR is
+    unset, and appends "-" plus the first 8 hex chars of the SHA-256 of the
+    NFC-normalised config dir path when it is set. Reproducing that derivation is
+    what lets ccp park a credential where a Claude Code process will find it.
+    """
+    norm = unicodedata.normalize("NFC", str(slot_dir(n)))
+    return "Claude Code-credentials-" + sha256(norm.encode()).hexdigest()[:8]
+
+
+def kc_read(svc: str) -> str | None:
+    r = subprocess.run(
+        ["security", "find-generic-password", "-a", kc_account(), "-w", "-s", svc],
+        capture_output=True, text=True,
+    )
+    out = r.stdout.strip()
+    return out if r.returncode == 0 and out else None
+
+
+def kc_write(svc: str, blob: str) -> bool:
+    """Write the same way Claude Code does: -U to update, -X for a hex payload."""
+    r = subprocess.run(
+        ["security", "add-generic-password", "-U", "-a", kc_account(),
+         "-s", svc, "-X", blob.encode().hex()],
+        capture_output=True, text=True,
+    )
+    return r.returncode == 0
+
+
+def kc_delete(svc: str) -> bool:
+    r = subprocess.run(
+        ["security", "delete-generic-password", "-a", kc_account(), "-s", svc],
+        capture_output=True, text=True,
+    )
+    return r.returncode == 0
+
+
+def valid_blob(blob: str | None) -> bool:
+    """Never write junk into the live entry — it would break every open session."""
+    if not blob:
+        return False
+    try:
+        return bool((json.loads(blob).get("claudeAiOauth") or {}).get("accessToken"))
+    except ValueError:
+        return False
+
+
+def expire_now(blob: str) -> str:
+    """Expire the access token without touching the refresh token.
+
+    An access token lasts about eight hours and an open session holds it in memory,
+    so it would not re-read the keychain until that token expired. Backdating
+    `expiresAt` makes the process's next token check decide a refresh is due; it
+    refreshes with the incoming account's refresh token and thereby adopts that
+    identity. Nothing is revoked, so the operation stays reversible.
+    """
+    d = json.loads(blob)
+    d["claudeAiOauth"]["expiresAt"] = int(time.time() * 1000) - 60_000
+    return json.dumps(d, separators=(",", ":"))
+
+
+def copy_cred(src_svc: str, dst_svc: str, what: str, nudge: bool = False) -> None:
+    blob = kc_read(src_svc)
+    if not valid_blob(blob):
+        die(f"{what}: source credential is missing or invalid ({src_svc})")
+    payload = expire_now(blob) if nudge else blob
+    if not kc_write(dst_svc, payload):
+        die(f"{what}: keychain write failed ({dst_svc})")
+    if kc_read(dst_svc) != payload:
+        die(f"{what}: read-back verification did not match ({dst_svc})")
+
+
+# --------------------------------------------------------------------------- #
+# slots
+# --------------------------------------------------------------------------- #
+
+def slot_dir(n: int) -> Path:
+    return SLOTS / str(n)
+
+
+def slots() -> list[int]:
+    REG.mkdir(parents=True, exist_ok=True)
+    ns = []
+    for f in REG.glob("slot*.dir"):
+        m = re.match(r"^slot(\d+)$", f.stem)
+        if m:
+            ns.append(int(m.group(1)))
+    return sorted(ns)
+
+
+def live_slot() -> int | None:
+    if not LIVE_STATE.is_file():
+        return None
+    t = LIVE_STATE.read_text().strip()
+    return int(t) if t.isdigit() else None
+
+
+def next_free() -> int:
+    used = set(slots())
+    n = 1
+    while n in used:
+        n += 1
+    return n
+
+
+def read_json(p: Path) -> dict:
+    try:
+        return json.loads(p.read_text())
+    except (OSError, ValueError):
+        return {}
+
+
+def account_of(n: int) -> str:
+    oa = read_json(slot_dir(n) / ".claude.json").get("oauthAccount") or {}
+    email = oa.get("emailAddress") or "—"
+    org = oa.get("organizationName")
+    return f"{email} ({org})" if org else email
+
+
+def resolve(token: str) -> int:
+    """Accept `2`, `slot2`, or the email (or a prefix) of the slot's account."""
+    ns = slots()
+    m = re.match(r"^(?:slot)?(\d+)$", token)
+    if m:
+        n = int(m.group(1))
+        if n in ns:
+            return n
+        die(f"slot{n} does not exist. Create it with `ccp add {n}`.")
+    hits = [n for n in ns if account_of(n).split(" ")[0].lower().startswith(token.lower())]
+    if len(hits) == 1:
+        return hits[0]
+    if len(hits) > 1:
+        die(f"'{token}' matches several slots: " + ", ".join(f"slot{n}" for n in hits))
+    listing = "\n".join(f"    {C['c']}slot{n:<6}{C['0']} {account_of(n)}" for n in ns)
+    die(f"'{token}' is neither a slot nor a known account.\n"
+        f"  slots:\n{listing}\n  create a new one: ccp add")
+
+
+# --------------------------------------------------------------------------- #
+# identity (.claude.json)
+# --------------------------------------------------------------------------- #
+
+ID_KEYS = ("oauthAccount", "userID", "hasAvailableSubscription")
+
+
+def patch_json(p: Path, updates: dict) -> None:
+    """Read-modify-write only `updates`, so unrelated state is preserved."""
+    d = read_json(p)
+    d.update(updates)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps(d, indent=2, ensure_ascii=False) + "\n")
+
+
+def park_identity(n: int) -> None:
+    live = read_json(HOME / ".claude.json")
+    patch_json(slot_dir(n) / ".claude.json", {k: live[k] for k in ID_KEYS if k in live})
+
+
+def load_identity(n: int) -> None:
+    parked = read_json(slot_dir(n) / ".claude.json")
+    if any(k in parked for k in ID_KEYS):
+        patch_json(HOME / ".claude.json", {k: parked[k] for k in ID_KEYS if k in parked})
+
+
+# --------------------------------------------------------------------------- #
+# shared symlinks
+# --------------------------------------------------------------------------- #
+
+def is_private(name: str) -> bool:
+    return name in PRIVATE or name.endswith(PRIVATE_SUFFIX)
+
+
+def sync(n: int, quiet: bool = False) -> None:
+    """Symlink everything shareable from ~/.claude into the slot dir. Idempotent."""
+    d = slot_dir(n)
+    d.mkdir(parents=True, exist_ok=True)
+    ok = new = skipped = 0
+    for src in sorted(LIVE_DIR.iterdir()):
+        if is_private(src.name):
+            continue
+        dst = d / src.name
+        if dst.is_symlink():
+            if os.readlink(dst) == str(src):
+                ok += 1
+                continue
+            dst.unlink()
+            dst.symlink_to(src)
+            new += 1
+            continue
+        if dst.exists():
+            skipped += 1          # real content in the slot: never overwritten
+            continue
+        dst.symlink_to(src)
+        new += 1
+    if not quiet:
+        msg = f"{C['d']}sync slot{n}: {ok} ok, {new} (re)linked"
+        if skipped:
+            msg += f", {skipped} slot-owned"
+        print(msg + C["0"])
+
+
+def seed(n: int) -> None:
+    """Copy UI prefs and MCP servers so a new slot skips the onboarding wizard."""
+    d = slot_dir(n)
+    cur = read_json(d / ".claude.json")
+    src = read_json(HOME / ".claude.json")
+    for k in ("theme", "editorMode", "autoUpdates", "installMethod", "autoConnectIde",
+              "respectGitignore", "mcpServers", "shiftEnterKeyBindingInstalled",
+              "deepLinkTerminal"):
+        if k in src:
+            cur.setdefault(k, src[k])
+    cur.setdefault("hasCompletedOnboarding", True)
+    (d / ".claude.json").write_text(json.dumps(cur, indent=2, ensure_ascii=False) + "\n")
+
+
+def slot_env(n: int) -> dict[str, str]:
+    env = dict(os.environ)
+    env["CLAUDE_CONFIG_DIR"] = str(slot_dir(n))
+    return env
+
+
+# --------------------------------------------------------------------------- #
+# commands
+# --------------------------------------------------------------------------- #
+
+def cmd_ls(_a: list[str]) -> None:
+    ns = slots()
+    if not ns:
+        print("No slots yet. Run: ccp init")
+        return
+    lv = live_slot()
+    print(f"{C['b']}  {'SLOT':<7} {'ACCOUNT':<36} {'CREDENTIAL':<11} STATE{C['0']}")
+    for n in ns:
+        parked = valid_blob(kc_read(service_of(n)))
+        if n == lv:
+            state = f"{C['g']}LIVE{C['0']} {C['d']}— every session uses this{C['0']}"
+            cred = f"{C['g']}live{C['0']}       "
+        else:
+            state = f"{C['d']}parked{C['0']}" if parked else f"{C['y']}no login yet{C['0']}"
+            cred = f"{C['d']}parked{C['0']}     " if parked else f"{C['y']}—{C['0']}          "
+        mark = f"{C['g']}▸{C['0']}" if n == lv else " "
+        print(f"{mark} {C['c']}slot{n:<3}{C['0']} {account_of(n):<36} {cred} {state}")
+    print(f"\n{C['d']}`ccp swap <n>` switches the account for EVERY open session · "
+          f"`ccp add` creates slot{next_free()}{C['0']}")
+
+
+def cmd_swap(args: list[str]) -> None:
+    pos = [a for a in args if not a.startswith("-")]
+    if not pos:
+        die("usage: ccp swap <n> [--lazy]")
+    n = resolve(pos[0])
+    lv = live_slot()
+    if n == lv:
+        print(f"slot{n} is already live ({account_of(n)}) — nothing to do")
+        return
+    if not valid_blob(kc_read(service_of(n))):
+        die(f"slot{n} has no parked credential → ccp login {n}")
+
+    # 1) park the live credential back into its own slot, refreshes included
+    if lv is not None:
+        copy_cred(LIVE_SERVICE, service_of(lv), f"parking slot{lv}")
+        park_identity(lv)
+        print(f"{C['d']}  ↓ slot{lv} parked ({account_of(lv)}){C['0']}")
+    else:
+        print(f"{C['y']}  ! no live slot was registered; the previous live credential "
+              f"was not parked{C['0']}")
+
+    # 2) load the target slot as live
+    nudge = "--lazy" not in args
+    copy_cred(service_of(n), LIVE_SERVICE, f"loading slot{n}", nudge=nudge)
+    load_identity(n)
+    LIVE_STATE.write_text(f"{n}\n")
+
+    print(f"{C['g']}✓{C['0']} live is now {C['b']}slot{n}{C['0']} · {account_of(n)}")
+    if nudge:
+        print(f"{C['d']}  access token deliberately expired → open sessions refresh into "
+              f"this account on their next token check. Close nothing.{C['0']}")
+    else:
+        print(f"{C['d']}  --lazy: open sessions stay on the previous account until their "
+              f"token expires (up to ~8 h){C['0']}")
+
+
+def cmd_add(args: list[str]) -> None:
+    nums = [a for a in args if a.isdigit()]
+    n = int(nums[0]) if nums else next_free()
+    if n < 1:
+        die("slot numbers start at 1")
+    if n in slots():
+        die(f"slot{n} already exists → {short(slot_dir(n))}")
+    slot_dir(n).mkdir(parents=True, exist_ok=True)
+    REG.mkdir(parents=True, exist_ok=True)
+    (REG / f"slot{n}.dir").write_text(str(slot_dir(n)) + "\n")
+    if "--no-seed" not in args:
+        seed(n)
+    sync(n)
+    print(f"{C['g']}✓{C['0']} {C['b']}slot{n}{C['0']} created at {short(slot_dir(n))}")
+    print(f"  keychain: {C['d']}{service_of(n)}{C['0']}")
+    if valid_blob(kc_read(service_of(n))):
+        print(f"  {C['g']}a parked credential was already there{C['0']} → {account_of(n)}")
+    else:
+        print(f"  next: {C['c']}ccp login {n}{C['0']}")
+
+
+def cmd_login(args: list[str]) -> None:
+    if not args:
+        die("usage: ccp login <n>")
+    n = resolve(args[0])
+    sync(n, quiet=True)
+    lv = live_slot()
+    print(f"{C['d']}opening claude in slot{n} → run /login and pick the account{C['0']}")
+    subprocess.run(["claude", "/login"], env=slot_env(n))
+    if not valid_blob(kc_read(service_of(n))):
+        die(f"slot{n} still has no credential — the login did not complete")
+    print(f"{C['g']}✓{C['0']} slot{n} · {account_of(n)}")
+    if n == lv:
+        # the slot we just logged into was already live: refresh the live entry
+        copy_cred(service_of(n), LIVE_SERVICE, f"refreshing live from slot{n}")
+        load_identity(n)
+        print(f"{C['d']}  slot{n} was live → live credential updated{C['0']}")
+    else:
+        print(f"  to use it in your open sessions: {C['c']}ccp swap {n}{C['0']}")
+
+
+def cmd_logout(args: list[str]) -> None:
+    if not args:
+        die("usage: ccp logout <n>")
+    n = resolve(args[0])
+    if n == live_slot():
+        die(f"slot{n} is live. Swap to another slot first (`ccp swap <m>`), then log "
+            f"this one out.")
+    if not valid_blob(kc_read(service_of(n))):
+        print(f"slot{n} has no parked credential")
+        return
+    if not kc_delete(service_of(n)):
+        die(f"could not delete slot{n}'s credential")
+    print(f"{C['g']}✓{C['0']} slot{n} logged out {C['d']}(config dir untouched){C['0']}")
+
+
+def cmd_pin(args: list[str]) -> None:
+    """Run a claude nailed to one slot, immune to swaps."""
+    if not args:
+        die("usage: ccp pin <n> [claude args...]")
+    n = resolve(args[0])
+    if n == live_slot():
+        die(f"slot{n} is live: just use plain `claude`, which is already that account.\n"
+            f"  (pinning a process to the live slot would make refresh tokens diverge)")
+    if not valid_blob(kc_read(service_of(n))):
+        die(f"slot{n} has no parked credential → ccp login {n}")
+    rest = [a for a in args[1:] if a != "--"]
+    sync(n, quiet=True)
+    os.execvpe("claude", ["claude", *rest], slot_env(n))
+
+
+def cmd_sync(args: list[str]) -> None:
+    for n in ([resolve(args[0])] if args else slots()):
+        sync(n)
+    print(f"{C['g']}✓{C['0']} shared symlinks up to date")
+
+
+def cmd_live(_a: list[str]) -> None:
+    lv = live_slot()
+    print("(none)" if lv is None else f"slot{lv}\t{account_of(lv)}")
+
+
+def cmd_rm(args: list[str]) -> None:
+    if not args:
+        die("usage: ccp rm <n> [--purge]")
+    n = resolve(args[0])
+    if n == live_slot():
+        die(f"slot{n} is live. Swap to another slot before removing it.")
+    (REG / f"slot{n}.dir").unlink(missing_ok=True)
+    if "--purge" in args:
+        shutil.rmtree(slot_dir(n), ignore_errors=True)
+        kc_delete(service_of(n))
+        print(f"{C['g']}✓{C['0']} slot{n} removed: registration, dir and credential")
+    else:
+        print(f"{C['g']}✓{C['0']} slot{n} unregistered "
+              f"{C['d']}(dir and credential kept; `ccp add {n}` restores it){C['0']}")
+
+
+def cmd_init(_a: list[str]) -> None:
+    """Park the credential you are logged in with into slot1 and mark it live."""
+    if not slots():
+        n = 1
+        slot_dir(n).mkdir(parents=True, exist_ok=True)
+        REG.mkdir(parents=True, exist_ok=True)
+        (REG / f"slot{n}.dir").write_text(str(slot_dir(n)) + "\n")
+        seed(n)
+        sync(n, quiet=True)
+    if live_slot() is None:
+        if not valid_blob(kc_read(LIVE_SERVICE)):
+            die("no live credential in the keychain — run `claude` and /login first")
+        n = 1 if 1 in slots() else slots()[0]
+        copy_cred(LIVE_SERVICE, service_of(n), f"parking the live credential in slot{n}")
+        live_id = read_json(HOME / ".claude.json")
+        patch_json(slot_dir(n) / ".claude.json",
+                   {k: live_id[k] for k in ID_KEYS if k in live_id})
+        LIVE_STATE.write_text(f"{n}\n")
+        print(f"{C['g']}✓{C['0']} live credential parked in slot{n} "
+              f"({account_of(n)}) and marked live")
+    cmd_ls([])
+
+
+def cmd_doctor(_a: list[str]) -> None:
+    """Self-check. ccp rides on undocumented internals; this says whether they hold."""
+    ok = True
+
+    def line(good: bool, label: str, detail: str = "") -> None:
+        nonlocal ok
+        ok = ok and good
+        icon = f"{C['g']}✓{C['0']}" if good else f"{C['r']}✗{C['0']}"
+        print(f"  {icon} {label}" + (f" {C['d']}{detail}{C['0']}" if detail else ""))
+
+    print(f"{C['b']}ccp {VERSION} doctor{C['0']}")
+
+    line(sys.platform == "darwin", "platform is macOS", sys.platform)
+
+    claude = shutil.which("claude")
+    if claude:
+        v = subprocess.run([claude, "--version"], capture_output=True, text=True)
+        line(True, "claude on PATH", v.stdout.strip() or claude)
+    else:
+        line(False, "claude on PATH", "not found")
+
+    r = subprocess.run(["security", "list-keychains"], capture_output=True, text=True)
+    line(r.returncode == 0, "login keychain reachable")
+
+    live_blob = kc_read(LIVE_SERVICE)
+    line(valid_blob(live_blob), "live credential present", LIVE_SERVICE)
+    if valid_blob(live_blob):
+        exp = (json.loads(live_blob)["claudeAiOauth"].get("expiresAt") or 0) / 1000
+        left = (exp - time.time()) / 3600
+        print(f"    {C['d']}access token expires in {left:+.2f} h{C['0']}")
+
+    ns = slots()
+    line(bool(ns), "slots registered", ", ".join(f"slot{n}" for n in ns) or "none")
+
+    lv = live_slot()
+    line(lv in ns if ns else False, "live slot recorded",
+         f"slot{lv}" if lv else "missing — run `ccp init`")
+
+    for n in ns:
+        d = slot_dir(n)
+        parked = valid_blob(kc_read(service_of(n)))
+        links = sum(1 for x in d.iterdir() if x.is_symlink()) if d.is_dir() else 0
+        state = "live" if n == lv else ("parked" if parked else "no credential")
+        print(f"    {C['d']}slot{n}: {state}, {links} shared symlinks, "
+              f"{service_of(n)}{C['0']}")
+
+    print(f"\n{'all good' if ok else C['y'] + 'problems above' + C['0']}")
+    raise SystemExit(0 if ok else 1)
+
+
+HELP = f"""{C['b']}ccp {VERSION}{C['0']} — switch Claude Code accounts without closing a session
+
+  {C['c']}ccp ls{C['0']}                slots, the account in each, which one is live
+  {C['c']}ccp swap{C['0']} <n>          {C['b']}switch the account for EVERY open session{C['0']}
+  {C['c']}ccp add{C['0']} [n]           create a slot (no n: first free number)
+  {C['c']}ccp login{C['0']} <n>         run /login in that slot and park its credential
+  {C['c']}ccp logout{C['0']} <n>        delete a slot's parked credential
+  {C['c']}ccp pin{C['0']} <n> ...       run a claude nailed to one slot, immune to swaps
+  {C['c']}ccp live{C['0']}              which slot is live right now
+  {C['c']}ccp sync{C['0']} [n]          rebuild the shared symlinks (idempotent)
+  {C['c']}ccp rm{C['0']} <n>            unregister a slot  [--purge deletes dir + credential]
+  {C['c']}ccp doctor{C['0']}            self-check the environment and state
+  {C['c']}ccp init{C['0']}              park your current login into slot1
+
+{C['d']}<n> accepts `2`, `slot2`, or the account's email.
+
+How it works: every plain `claude` runs in ~/.claude and reads ONE keychain entry.
+`ccp swap` exchanges the contents of that entry, so the account changes for all live
+sessions without closing anything. It always parks the outgoing credential first, so
+rotating refresh tokens never diverge. `ccp pin` is the opposite: a process nailed to
+one slot that swaps do not touch.
+
+Not affiliated with Anthropic. Use only with accounts you own.{C['0']}"""
+
+
+CMDS = {
+    "ls": cmd_ls, "list": cmd_ls,
+    "swap": cmd_swap, "use": cmd_swap, "switch": cmd_swap,
+    "add": cmd_add, "new": cmd_add,
+    "login": cmd_login, "logout": cmd_logout,
+    "pin": cmd_pin, "run": cmd_pin,
+    "live": cmd_live, "active": cmd_live, "current": cmd_live,
+    "sync": cmd_sync, "rm": cmd_rm, "remove": cmd_rm,
+    "init": cmd_init, "doctor": cmd_doctor,
+}
+
+
+def main() -> None:
+    argv = sys.argv[1:]
+    if not argv or argv[0] in ("-h", "--help", "help"):
+        print(HELP)
+        return
+    if argv[0] in ("-V", "--version", "version"):
+        print(f"ccp {VERSION}")
+        return
+    fn = CMDS.get(argv[0])
+    if not fn:
+        die(f"unknown command '{argv[0]}' — try `ccp --help`")
+    require_macos()
+    fn(argv[1:])
+
+
+if __name__ == "__main__":
+    main()
