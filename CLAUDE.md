@@ -1,13 +1,5 @@
 # CLAUDE.md — claude-code-account-switcher
 
-```regla
-REGLA      un agente lee y prueba este repo; nunca ejecuta `bin/ccp`, `install.*` ni `uninstall.*` contra la HOME real
-APLICA     toda sesión sobre este repo, abierto solo o dentro de su monorepo
-PROHIBIDO  correrlo con `sudo` · leer o volcar la credencial viva, el llavero o `~/.claude.json` · probar fuera de `tests/test_ccp.py`
-PRUEBA     python3 tests/test_ccp.py
-REF        ./docs/security.md · ./docs/how-it-works.md
-```
-
 `ccp` — switches which Claude account an open Claude Code session uses, from another terminal,
 without closing the session or logging out. Works by swapping the live credential and letting the
 session's next token refresh pick up the new account.
