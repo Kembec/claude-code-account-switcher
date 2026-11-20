@@ -94,7 +94,7 @@ if (Test-Path $settings) {
 }
 
 # --- the command itself ----------------------------------------------------- #
-foreach ($f in 'ccp', 'ccp.cmd', 'ccp-statusline.py') {
+foreach ($f in 'ccp', 'ccp.cmd', 'ccp_history.py', 'ccp-statusline.py') {
     $p = Join-Path $BinDir $f
     if (Test-Path $p) { Remove-Item $p -Force; Write-Host "    removed $p" }
 }

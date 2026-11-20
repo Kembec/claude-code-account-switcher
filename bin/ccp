@@ -38,7 +38,7 @@ import unicodedata
 from hashlib import sha256
 from pathlib import Path
 
-VERSION = "1.1.3"
+VERSION = "1.2.0"
 
 HOME = Path.home()
 LIVE_DIR = HOME / ".claude"             # config dir every plain `claude` uses
@@ -461,6 +461,13 @@ def slot_env(n: int) -> dict[str, str]:
     return env
 
 
+def history():
+    """bin/ccp_history.py, installed next to this script (symlinks resolved)."""
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    import ccp_history
+    return ccp_history
+
+
 def run_claude(argv: list[str], env: dict[str, str], replace: bool = False) -> int:
     """Run claude. Replacing the process is nicer, but Windows has no real exec."""
     exe = shutil.which("claude")
@@ -551,26 +558,6 @@ def cmd_add(args: list[str]) -> None:
         print(f"  {C['g']}a parked credential was already there{C['0']} -> {account_of(n)}")
     else:
         print(f"  next: {C['c']}ccp login {n}{C['0']}")
-
-
-def cmd_login(args: list[str]) -> None:
-    if not args:
-        die("usage: ccp login <n>")
-    n = resolve(args[0])
-    sync(n, quiet=True)
-    lv = live_slot()
-    print(f"{C['d']}opening claude in slot{n} -> run /login and pick the account{C['0']}")
-    run_claude(["/login"], slot_env(n))
-    if not valid_blob(slot_store(n).read()):
-        die(f"slot{n} still has no credential - the login did not complete")
-    print(f"{C['g']}OK{C['0']} slot{n} · {account_of(n)}")
-    if n == lv:
-        # the slot we just logged into was already live: refresh the live store
-        copy_cred(slot_store(n), live_store(), f"refreshing live from slot{n}")
-        load_identity(n)
-        print(f"{C['d']}  slot{n} was live -> live credential updated{C['0']}")
-    else:
-        print(f"  to use it in your open sessions: {C['c']}ccp swap {n}{C['0']}")
 
 
 def cmd_logout(args: list[str]) -> None:
@@ -720,6 +707,9 @@ HELP = f"""{C['b']}ccp {VERSION}{C['0']} - switch Claude Code accounts without c
   {C['c']}ccp add{C['0']} [n]           create a slot (no n: first free number)
   {C['c']}ccp login{C['0']} <n>         run /login in that slot and park its credential
   {C['c']}ccp logout{C['0']} <n>        delete a slot's parked credential
+  {C['c']}ccp history{C['0']} <n>       accounts the slot held before  [--json]
+  {C['c']}ccp use{C['0']} <n> <acc>     put a past account back in slot n; the current one
+                        moves to its history (not on the live slot)  [--json]
   {C['c']}ccp pin{C['0']} <n> ...       run a claude nailed to one slot, immune to swaps
   {C['c']}ccp live{C['0']}              which slot is live right now
   {C['c']}ccp sync{C['0']} [n]          rebuild the shared links (idempotent)
@@ -741,9 +731,13 @@ Not affiliated with Anthropic. Use only with accounts you own.{C['0']}"""
 
 CMDS = {
     "ls": cmd_ls, "list": cmd_ls,
-    "swap": cmd_swap, "use": cmd_swap, "switch": cmd_swap,
+    "swap": cmd_swap, "switch": cmd_swap,
+    "use": lambda a: history().cmd_use(sys.modules[__name__], a),
     "add": cmd_add, "new": cmd_add,
-    "login": cmd_login, "logout": cmd_logout,
+    "login": lambda a: history().cmd_login(sys.modules[__name__], a),
+    "logout": cmd_logout,
+    "history": lambda a: history().cmd_history(sys.modules[__name__], a),
+    "restore": lambda a: history().cmd_restore(sys.modules[__name__], a),
     "pin": cmd_pin, "run": cmd_pin,
     "live": cmd_live, "active": cmd_live, "current": cmd_live,
     "sync": cmd_sync, "rm": cmd_rm, "remove": cmd_rm,
