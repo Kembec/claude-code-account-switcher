@@ -46,7 +46,7 @@ https://docs.claude.com/en/docs/claude-code
 
 # --- place the files -------------------------------------------------------- #
 New-Item -ItemType Directory -Force -Path $BinDir | Out-Null
-foreach ($f in 'ccp', 'ccp-statusline.py') {
+foreach ($f in 'ccp', 'ccp_history.py', 'ccp-statusline.py') {
     $dst = Join-Path $BinDir $f
     Remove-Item $dst -Force -ErrorAction SilentlyContinue
     if ($Copy) {

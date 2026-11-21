@@ -86,7 +86,7 @@ PY
 
 # --- the command itself ----------------------------------------------------- #
 for d in "$HOME/.local/bin" /Users/Shared/ccp /Users/Shared/claude-ccp /opt/ccp; do
-  for f in ccp ccp.cmd ccp-statusline.py statusline-slot.py; do
+  for f in ccp ccp.cmd ccp_history.py ccp-statusline.py statusline-slot.py; do
     { [ -e "$d/$f" ] || [ -L "$d/$f" ]; } || continue
     rm -f "$d/$f"
     echo "    removed $d/$f"
