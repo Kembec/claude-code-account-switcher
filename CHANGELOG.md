@@ -14,10 +14,15 @@
   account (exit 2 only if the rollback itself fails, with the credential still in the
   vault). It refuses the live slot, like `logout` and `pin`. `ccp use <n>` alone still
   swaps.
-- Logging in to the live slot first parks the live credential, so the archived copy
-  carries the latest refresh token.
+- One change of a slot at a time: `login`, `use <n> <account>` and `restore` take an OS
+  lock on `~/.claude-profiles/history/slot<n>.lock` (flock, or msvcrt on Windows), which
+  the kernel releases if ccp dies, so a lock is never stale. A second change gets `busy`.
+- Logging in to the live slot archives the outgoing account from the live store right
+  before it is overwritten, so the archive carries the token open sessions kept rotating.
+  A login that cannot start (no `claude` on PATH) leaves no copy behind in the vault.
 - The installers place and remove the new `bin/ccp_history.py` next to `ccp`.
-- `tests/test_history.py`: 29 checks for all of the above, including both rollback paths.
+- `tests/test_history.py`: 41 checks for all of the above, including both rollback paths
+  and the failed-rollback exit 2.
 
 ## 1.1.3
 

@@ -464,6 +464,7 @@ def slot_env(n: int) -> dict[str, str]:
 def history():
     """bin/ccp_history.py, installed next to this script (symlinks resolved)."""
     sys.path.insert(0, str(Path(__file__).resolve().parent))
+    sys.dont_write_bytecode = True  # no __pycache__ left in the install dir
     import ccp_history
     return ccp_history
 

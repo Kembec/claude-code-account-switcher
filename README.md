@@ -218,7 +218,7 @@ is exercised on every run.
 
 ```console
 python3 tests/test_ccp.py      # 58 checks, no network, touches nothing real
-python3 tests/test_history.py  # 29 checks: login archive, history, use, rollback
+python3 tests/test_history.py  # 41 checks: login archive, history, use, lock, rollback
 ```
 
 **Verified under PowerShell:** `install.ps1` parses clean on pwsh 7.6.4, the block it

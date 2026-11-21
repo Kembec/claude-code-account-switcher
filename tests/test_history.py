@@ -22,6 +22,11 @@ from test_ccp import Sandbox, check, section  # noqa: E402
 
 FAKE_CLAUDE = r'''#!/usr/bin/env python3
 import json, os, sys, time
+rot = os.environ.get("FAKE_ROTATE_LIVE", "")  # open sessions refreshing during /login
+if rot:
+    live = os.path.join(os.environ["HOME"], ".claude", ".credentials.json")
+    open(live, "w").write(json.dumps({"claudeAiOauth": {"accessToken": "access-" + rot,
+        "refreshToken": "refresh-" + rot, "expiresAt": int((time.time() + 8 * 3600) * 1000)}}))
 spec = os.environ.get("FAKE_LOGIN", "")
 if not spec:
     sys.exit(0)
@@ -173,6 +178,76 @@ def test_failure_keeps_slot(sb: HistSandbox) -> None:
           "no token duplicated by the rollback")
 
 
+def test_lock(sb: HistSandbox) -> None:
+    section("one change of a slot at a time, login included")
+    import fcntl
+    lock = sb.home / ".claude-profiles" / "history" / "slot2.lock"
+    before = (sb.token(2), sb.past(2))
+    fd = os.open(lock, os.O_CREAT | os.O_RDWR, 0o600)
+    fcntl.flock(fd, fcntl.LOCK_EX)
+    try:
+        r = sb.run("use", "2", "x@example.com", "--json")
+        check(r.returncode == 1 and json.loads(r.stdout)["reason"] == "busy", "use while held: busy")
+        r = sb.run("login", "2", FAKE_LOGIN="W:w@example.com")
+        check(r.returncode != 0 and "in progress" in r.stderr, "login while held: refused")
+        check((sb.token(2), sb.past(2)) == before, "slot and history untouched")
+    finally:
+        os.close(fd)
+    r = sb.run("use", "2", "x@example.com")
+    check(r.returncode == 0 and lock.exists(), "a lock file nobody holds does not block")
+    sb.run("use", "2", "y@example.com")
+
+
+def test_login_without_claude(sb: HistSandbox) -> None:
+    section("a login that cannot start leaves no duplicate in the vault")
+    before = (sb.token(2), sb.past(2))
+    empty = sb.home / "emptybin"
+    empty.mkdir(exist_ok=True)
+    r = sb.run("login", "2", PATH=str(empty))
+    check(r.returncode != 0 and "not on PATH" in r.stderr, "missing claude reported")
+    check((sb.token(2), sb.past(2)) == before, "slot and history unchanged")
+    check(sb.holders("refresh-Y2") == 1, "the slot's token was not left in the vault too")
+
+
+def test_live_login_archives_freshest(sb: HistSandbox) -> None:
+    section("login on the live slot archives the token the sessions kept rotating")
+    r = sb.run("login", "1", FAKE_LOGIN="Z:z@example.com", FAKE_ROTATE_LIVE="Q")
+    check(r.returncode == 0 and sb.token(None) == "access-Z", "live now holds z")
+    entry = next((e for e in sb.history(1).get("past", []) if e["email"] == "a@example.com"), None)
+    vault = Path(entry["dir"]) / ".credentials.json" if entry else None
+    check(bool(vault) and "refresh-Q" in vault.read_text(), "a's archive is the rotated token")
+    check(sb.holders("refresh-Q") == 1, "and it lives only in the vault")
+
+
+def test_rollback_failure_exit2(sb: HistSandbox) -> None:
+    section("a failed rollback is exit 2 and keeps the previous credential (in process)")
+    import importlib.util
+    from importlib.machinery import SourceFileLoader
+    saved = {k: os.environ.get(k) for k in ("HOME", "CCP_BACKEND")}
+    os.environ.update(HOME=str(sb.home), CCP_BACKEND="file")
+    try:
+        loader = SourceFileLoader("ccp_core", str(t.CCP))
+        core = importlib.util.module_from_spec(importlib.util.spec_from_loader("ccp_core", loader))
+        loader.exec_module(core)
+        hist = core.history().History(core)
+        slot_cred, original = core.slot_store(2).path, core.slot_store(2).read()
+        put = hist._put  # the rollback's write into the slot is the one that fails
+        hist._put = lambda store, blob: (False if blob == original and store.path == slot_cred
+                                         else put(store, blob))
+        hist._set_identity = lambda *_: (_ for _ in ()).throw(OSError("identity write failed"))
+        try:
+            hist.restore(2, "x@example.com")
+            code = 0
+        except core.history().Refused as r:
+            code = r.code
+    finally:
+        for k, v in saved.items():
+            os.environ.pop(k, None) if v is None else os.environ.__setitem__(k, v)
+    check(code == 2, "rollback failure exits 2")
+    check(sb.holders("refresh-Y2") >= 1 and "y@example.com" in sb.past(2),
+          "the previous credential is kept in the history")
+
+
 def main() -> int:
     print(f"ccp history tests · {sys.platform} · python {sys.version.split()[0]}")
     sb = HistSandbox()
@@ -184,6 +259,10 @@ def main() -> int:
         test_use_moves(sb)
         test_use_refuses_live(sb)
         test_failure_keeps_slot(sb)
+        test_lock(sb)
+        test_login_without_claude(sb)
+        test_rollback_failure_exit2(sb)
+        test_live_login_archives_freshest(sb)
     finally:
         sb.stop()
     print(f"\n{t.passed} passed, {t.failed} failed")

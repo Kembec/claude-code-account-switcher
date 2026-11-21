@@ -28,13 +28,19 @@ from __future__ import annotations
 import json
 import os
 import shutil
-import time
+import sys
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from hashlib import sha256
 from pathlib import Path
 
+try:
+    import fcntl
+except ImportError:  # Windows
+    fcntl = None
+    import msvcrt
+
 META = ".ccp-entry.json"
-LOCK_STALE_S = 300
 
 
 class Refused(Exception):
@@ -87,22 +93,26 @@ class History:
         """Write and read back; a store that does not return the same bytes failed."""
         return bool(store.write(blob)) and store.read() == blob
 
-    def archive(self, n: int) -> str | None:
-        """Move-in half of a move: the slot's credential goes to its vault entry.
+    def archive(self, n: int, store=None, ident_dir: Path | None = None) -> str | None:
+        """Move-in half of a move: a credential goes to slot n's vault entry.
 
-        Returns the entry key, or None when the slot holds no valid credential.
-        The caller removes the slot's copy (or overwrites it) to finish the move.
+        Source: the slot's own store, or `store` + `ident_dir` (the live store and
+        HOME when slot n is live, because that copy is the one still rotating).
+        Returns the entry key, or None when the source holds no valid credential.
+        The caller removes the source copy (or overwrites it) to finish the move.
         """
-        blob = self.c.slot_store(n).read()
+        blob = (store or self.c.slot_store(n)).read()
         if not self.c.valid_blob(blob):
             return None
-        email, org, keys = self.identity(self.c.slot_dir(n))
+        email, org, keys = self.identity(ident_dir or self.c.slot_dir(n))
         key = self.key_of(email, org)
         entry = self.slot_root(n) / key
+        existed = entry.is_dir()
         entry.mkdir(parents=True, exist_ok=True)
         os.chmod(entry, 0o700)
         if not self._put(self.c.store_for(entry), blob):
-            self.drop(n, key)
+            if not existed:  # an older copy of the same account is never thrown away
+                self.drop(n, key)
             raise Refused("write_failed", f"could not archive slot{n}'s credential")
         (entry / ".claude.json").write_text(json.dumps(keys, indent=2) + "\n", encoding="utf-8")
         meta = {"email": email, "org": org, "from_slot": n,
@@ -110,10 +120,17 @@ class History:
         (entry / META).write_text(json.dumps(meta, indent=2) + "\n", encoding="utf-8")
         return key
 
-    def drop(self, n: int, key: str) -> None:
+    def drop(self, n: int, key: str) -> bool:
+        """Remove a vault entry. False when its credential would not go away: the dir
+        then stays, so the copy remains listed and reachable instead of orphaned."""
         entry = self.slot_root(n) / key
-        self.c.store_for(entry).delete()
+        store = self.c.store_for(entry)
+        if store.read() is not None and not (store.delete() and store.read() is None):
+            print(f"ccp: warning: could not delete the saved credential of slot{n}'s "
+                  f"past account {key}; it stays listed in `ccp history {n}`", file=sys.stderr)
+            return False
         shutil.rmtree(entry, ignore_errors=True)
+        return True
 
     def find(self, n: int, token: str) -> dict:
         es = self.entries(n)
@@ -127,24 +144,27 @@ class History:
 
     # -- lock ----------------------------------------------------------------- #
 
-    def lock(self, n: int) -> Path:
+    @contextmanager
+    def locked(self, n: int):
+        """One change of a slot at a time: login, use and restore all take it.
+
+        An OS lock on an open file (flock, or msvcrt on Windows), never a pid or an
+        age: the kernel releases it when the holder exits, so there is no stale lock
+        to break and no race between two processes breaking it. The file stays.
+        """
         self.root.mkdir(parents=True, exist_ok=True)
-        p = self.root / f"slot{n}.lock"
-        for _ in range(2):
+        fd = os.open(self.root / f"slot{n}.lock", os.O_CREAT | os.O_RDWR, 0o600)
+        try:
             try:
-                fd = os.open(p, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-                os.write(fd, f"{os.getpid()} {int(time.time())}\n".encode())
-                os.close(fd)
-                return p
-            except FileExistsError:
-                try:
-                    age = time.time() - p.stat().st_mtime
-                except OSError:
-                    continue
-                if age < LOCK_STALE_S:
-                    raise Refused("busy", f"another change of slot{n} is in progress")
-                p.unlink(missing_ok=True)
-        raise Refused("busy", f"another change of slot{n} is in progress")
+                if fcntl:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                else:
+                    msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+            except OSError:
+                raise Refused("busy", f"another change of slot{n} is in progress")
+            yield
+        finally:
+            os.close(fd)
 
     # -- login hooks ---------------------------------------------------------- #
 
@@ -171,11 +191,8 @@ class History:
         if n == self.c.live_slot():
             raise Refused("live", f"slot{n} is live: every open session uses it. "
                                   f"Swap to another slot first (`ccp swap <m>`).")
-        lock = self.lock(n)
-        try:
+        with self.locked(n):
             return self._restore(n, token)
-        finally:
-            lock.unlink(missing_ok=True)
 
     def _restore(self, n: int, token: str) -> dict:
         target = self.find(n, token)
@@ -288,7 +305,6 @@ def cmd_use(core, args: list[str]) -> None:
 
 def cmd_login(core, args: list[str]) -> None:
     """A login replaces the slot's account, so the outgoing one is archived first."""
-    C = core.C
     if not args:
         core.die("usage: ccp login <n>")
     n = core.resolve(args[0])
@@ -300,19 +316,35 @@ def cmd_login(core, args: list[str]) -> None:
         core.park_identity(n)
     hist = History(core)
     try:
-        archived = hist.before_login(n)  # the account this login may overwrite
+        with hist.locked(n):  # a concurrent `use` would be overwritten by this login
+            _login_locked(core, hist, n, lv)
     except Refused as r:
         core.die(f"{r.detail} - login not started")
+
+
+def _login_locked(core, hist: History, n: int, lv: int | None) -> None:
+    C = core.C
+    archived = hist.before_login(n)  # the account this login may overwrite
     print(f"{C['d']}opening claude in slot{n} -> run /login and pick the account{C['0']}")
-    core.run_claude(["/login"], core.slot_env(n))
-    hist.after_login(n, archived)
+    try:
+        core.run_claude(["/login"], core.slot_env(n))
+    finally:
+        # also when claude is missing or the login dies: no duplicate is left behind
+        hist.after_login(n, archived)
     if not core.valid_blob(core.slot_store(n).read()):
         core.die(f"slot{n} still has no credential - the login did not complete")
     print(f"{C['g']}OK{C['0']} slot{n} · {core.account_of(n)}")
-    if n == lv:
-        # the slot we just logged into was already live: refresh the live store
-        core.copy_cred(core.slot_store(n), core.live_store(), f"refreshing live from slot{n}")
-        core.load_identity(n)
-        print(f"{C['d']}  slot{n} was live -> live credential updated{C['0']}")
-    else:
+    if n != lv:
         print(f"  to use it in your open sessions: {C['c']}ccp swap {n}{C['0']}")
+        return
+    # Live slot: open sessions kept rotating the outgoing token during /login, so the
+    # archive is retaken from the live store right before that store is overwritten.
+    if archived and hist.identity(core.slot_dir(n))[:2] != archived[1]:
+        try:
+            hist.archive(n, store=core.live_store(), ident_dir=core.HOME)
+        except Refused as r:
+            core.die(f"{r.detail}. slot{n} now holds {core.account_of(n)}, but the live "
+                     f"account was left as it was so it is not lost")
+    core.copy_cred(core.slot_store(n), core.live_store(), f"refreshing live from slot{n}")
+    core.load_identity(n)
+    print(f"{C['d']}  slot{n} was live -> live credential updated{C['0']}")
