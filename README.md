@@ -133,6 +133,13 @@ ccp swap 2           # switch the account for EVERY open session
 families of processes refreshing the same credential from different stores is how
 you get a diverged refresh token.
 
+A slot keeps the accounts it held before. `ccp login <n>` moves the slot's current
+account into its history before `/login`; `ccp history <n> [--json]` lists them (email,
+org, when archived, whether the session is still there, never a token); and
+`ccp use <n> <account>` brings one back without a new login, moving the current one
+into the history. The credential is moved, not copied, and each write is read back;
+if a step fails the slot keeps its account. It also refuses the live slot.
+
 ### Statusline
 
 The installer sets a statusline so you can always see which account a session is on,
@@ -210,7 +217,8 @@ against a throwaway `HOME` and passes on macOS too, so the non-macOS credential 
 is exercised on every run.
 
 ```console
-python3 tests/test_ccp.py      # 53 checks, no network, touches nothing real
+python3 tests/test_ccp.py      # 58 checks, no network, touches nothing real
+python3 tests/test_history.py  # 54 checks: login archive, history, use, lock, rollback, purge
 ```
 
 **Verified under PowerShell:** `install.ps1` parses clean on pwsh 7.6.4, the block it
@@ -269,8 +277,8 @@ session reads. Both `ccp` and the installer refuse to run under `sudo` for that 
 `pwsh -ExecutionPolicy Bypass -File .\uninstall.ps1` on Windows. Either takes out the
 command, the shell profile block and the statusline — and the PATH entry on Windows.
 Neither touches the live credential, so you stay signed in to whatever account is live.
-Add `--purge` (`-Purge` in PowerShell) to also delete the slot directories and their
-parked credentials.
+Add `--purge` (`-Purge` in PowerShell) to also delete the slot directories, their
+parked credentials and the saved credentials of their past accounts.
 
 ## License
 

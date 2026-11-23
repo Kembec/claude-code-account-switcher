@@ -1,5 +1,34 @@
 # Changelog
 
+## 1.2.0
+
+- **A slot now keeps the accounts it held before.** `ccp login <n>` used to overwrite
+  the slot's credential, so going back from account B to A needed a new `/login`. Now
+  the outgoing account is moved into a per-slot vault (`~/.claude-profiles/history/`)
+  first, and the slot's store stays empty while `/login` runs, so a claude that
+  refreshes on start cannot rotate the saved token; an aborted login puts it back
+  intact, and re-logging the same account leaves no duplicate.
+- `ccp history <n> [--json]` lists the slot's past accounts: email, org, archive date and
+  whether the session is still there. It never prints a token.
+- `ccp use <n> <account>` puts a past account back and moves the current one into the
+  history. The credential is moved, never copied, so a rotating refresh token has one
+  holder; every write is read back, and a failed step rolls the slot back to its
+  account (exit 2 only if the rollback itself fails, with the credential still in the
+  vault). It refuses the live slot, like `logout` and `pin`. `ccp use <n>` alone still
+  swaps.
+- `ccp history <n> --purge` deletes a slot's past accounts, credential first (live slot
+  included); `ccp rm <n> --purge` and `uninstall --purge` now do it too, so no refresh
+  token is left behind in the keychain.
+- One change of a slot at a time: `login`, `use <n> <account>`, `restore` and `swap` take an OS
+  lock on `~/.claude-profiles/history/slot<n>.lock` (flock, or msvcrt on Windows), which
+  the kernel releases if ccp dies, so a lock is never stale. A second change gets `busy`.
+- Logging in to the live slot archives the outgoing account from the live store right
+  before it is overwritten, so the archive carries the token open sessions kept rotating.
+  A login that cannot start (no `claude` on PATH) leaves no copy behind in the vault.
+- The installers place and remove the new `bin/ccp_history.py` next to `ccp`.
+- `tests/test_history.py`: 41 checks for all of the above, including both rollback paths
+  and the failed-rollback exit 2.
+
 ## 1.1.3
 
 - **`ccp` and `install.sh` now refuse to run under `sudo`.** `sudo` leaves `HOME`

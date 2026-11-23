@@ -45,6 +45,14 @@ if ($Purge) {
                 & $ccp rm $n --purge *>$null
                 if ($LASTEXITCODE -eq 0) { Write-Host "    slot$n purged" }
             }
+        # past accounts of every slot, the live one included, before their dirs go
+        Get-ChildItem (Join-Path $reg 'history') -Directory -Filter 'slot*' -ErrorAction SilentlyContinue |
+            ForEach-Object {
+                $n = $_.Name -replace '^slot', ''
+                & $ccp history $n --purge *>$null
+                if ($LASTEXITCODE -eq 0) { Write-Host "    slot$n history purged" }
+                else { Write-Host "    ! slot$n history: some saved credentials could not be deleted" }
+            }
     } elseif (-not $ccp) {
         Write-Host '    ! ccp not callable; deleting slot dirs without clearing stores'
     }
@@ -94,7 +102,7 @@ if (Test-Path $settings) {
 }
 
 # --- the command itself ----------------------------------------------------- #
-foreach ($f in 'ccp', 'ccp.cmd', 'ccp-statusline.py') {
+foreach ($f in 'ccp', 'ccp.cmd', 'ccp_history.py', 'ccp-statusline.py') {
     $p = Join-Path $BinDir $f
     if (Test-Path $p) { Remove-Item $p -Force; Write-Host "    removed $p" }
 }

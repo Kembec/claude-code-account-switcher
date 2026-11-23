@@ -1,0 +1,339 @@
+#!/usr/bin/env python3
+"""End-to-end tests for a slot's account history (`ccp login`, `history`, `use <n> <acc>`).
+
+    python3 tests/test_history.py
+
+Same harness as test_ccp.py: throwaway HOME, file backend, the real CLI. `/login` is a
+fake `claude` on PATH that writes the account named in FAKE_LOGIN ("tag:email") into
+the slot's config dir, or does nothing when FAKE_LOGIN is empty (an aborted login).
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import stat
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import test_ccp as t  # noqa: E402
+from test_ccp import Sandbox, check, section  # noqa: E402
+
+FAKE_CLAUDE = r'''#!/usr/bin/env python3
+import json, os, sys, time
+rot = os.environ.get("FAKE_ROTATE_LIVE", "")  # open sessions refreshing during /login
+if rot:
+    live = os.path.join(os.environ["HOME"], ".claude", ".credentials.json")
+    open(live, "w").write(json.dumps({"claudeAiOauth": {"accessToken": "access-" + rot,
+        "refreshToken": "refresh-" + rot, "expiresAt": int((time.time() + 8 * 3600) * 1000)}}))
+if os.environ.get("FAKE_SEEN"):  # what /login finds in the slot's store when it starts
+    c = os.path.join(os.environ["CLAUDE_CONFIG_DIR"], ".credentials.json")
+    open(os.path.join(os.environ["HOME"], "seen-at-login"), "w").write(
+        open(c).read() if os.path.isfile(c) else "")
+spec = os.environ.get("FAKE_LOGIN", "")
+if not spec:
+    sys.exit(0)
+tag, email = spec.split(":", 1)
+d = os.environ["CLAUDE_CONFIG_DIR"]
+cred = {"claudeAiOauth": {"accessToken": "access-" + tag, "refreshToken": "refresh-" + tag,
+        "expiresAt": int((time.time() + 8 * 3600) * 1000)}}
+open(os.path.join(d, ".credentials.json"), "w").write(json.dumps(cred))
+p = os.path.join(d, ".claude.json")
+cur = json.load(open(p)) if os.path.isfile(p) else {}
+cur["oauthAccount"] = {"emailAddress": email, "organizationName": "Test"}
+open(p, "w").write(json.dumps(cur))
+'''
+
+
+class HistSandbox(Sandbox):
+    def __init__(self) -> None:
+        super().__init__()
+        self.bin = self.home / "fakebin"
+        self.bin.mkdir()
+        exe = self.bin / "claude"
+        exe.write_text(FAKE_CLAUDE)
+        exe.chmod(0o755)
+
+    def run(self, *args: str, **envextra: str):
+        envextra.setdefault("PATH", f"{self.bin}{os.pathsep}{os.environ.get('PATH', '')}")
+        envextra.setdefault("FAKE_LOGIN", "")
+        return super().run(*args, **envextra)
+
+    def history(self, n: int) -> dict:
+        r = self.run("history", str(n), "--json")
+        return json.loads(r.stdout) if r.returncode == 0 else {"error": r.stderr}
+
+    def past(self, n: int) -> list[str]:
+        return [e["email"] for e in self.history(n).get("past", [])]
+
+    def holders(self, secret: str) -> int:
+        """How many files under HOME hold this token: a move leaves exactly one."""
+        count = 0
+        for root, _dirs, files in os.walk(self.home):
+            for f in files:
+                try:
+                    count += secret in (Path(root) / f).read_text(errors="ignore")
+                except OSError:
+                    pass
+        return count
+
+
+def setup(sb: HistSandbox) -> None:
+    sb.put_cred(None, "A")
+    sb.put_identity(None, "a@example.com")
+    sb.run("init")
+    sb.run("add")
+    sb.put_cred(2, "X")
+    sb.put_identity(2, "x@example.com")
+
+
+def test_login_archives(sb: HistSandbox) -> None:
+    section("login archives the slot's account before /login")
+    r = sb.run("login", "2", FAKE_LOGIN="Y:y@example.com")
+    check(r.returncode == 0 and sb.token(2) == "access-Y", "slot2 now holds y")
+    check(sb.past(2) == ["x@example.com"], "x moved to slot2's history")
+    check(sb.holders("refresh-X") == 1, "x's refresh token lives in one place (the vault)")
+
+    r = sb.run("login", "2", FAKE_LOGIN="Y2:y@example.com")
+    check(r.returncode == 0 and sb.past(2) == ["x@example.com"],
+          "re-login of the same account leaves no duplicate entry")
+
+    r = sb.run("login", "2")
+    check(sb.token(2) == "access-Y2" and sb.past(2) == ["x@example.com"],
+          "an aborted login keeps the slot and the history as they were")
+    check(sb.holders("refresh-Y2") == 1, "aborted login left no copy in the vault")
+
+
+def test_history_json(sb: HistSandbox) -> None:
+    section("history --json lists past accounts and never a token")
+    r = sb.run("history", "2", "--json")
+    check(r.returncode == 0, "history --json exits 0")
+    check("access-" not in r.stdout and "refresh-" not in r.stdout, "no token in the output")
+    h = json.loads(r.stdout)
+    e = h["past"][0]
+    check(h["current"]["email"] == "y@example.com", "current account reported")
+    check(e["email"] == "x@example.com" and e["org"] == "Test", "email and org of the entry")
+    check(bool(e["archived_at"]) and e["has_credential"] is True, "archive date and session flag")
+    check(h["live"] is False and sb.history(1)["live"] is True, "live flag per slot")
+
+
+def test_use_moves(sb: HistSandbox) -> None:
+    section("use <n> <account> moves the credential, it never copies it")
+    r = sb.run("use", "2", "x@example.com", "--json")
+    out = json.loads(r.stdout)
+    check(r.returncode == 0 and out["ok"] is True, "use exits 0 with ok")
+    check(sb.token(2) == "access-X" and sb.identity(2) == "x@example.com",
+          "slot2 holds x again, credential and identity")
+    check(sb.past(2) == ["y@example.com"], "y moved to the history, x left it")
+    check(sb.holders("refresh-X") == 1 and sb.holders("refresh-Y2") == 1,
+          "each refresh token in exactly one store")
+    check("refresh-" not in r.stdout, "use prints no token")
+
+    r = sb.run("use", "2", "y@")
+    check(r.returncode == 0 and sb.token(2) == "access-Y2" and sb.past(2) == ["x@example.com"],
+          "and back again (A->B->A) without a login")
+
+    r = sb.run("use", "2", "y@example.com", "--json")
+    check(r.returncode != 0 and json.loads(r.stdout)["reason"] == "unknown_account",
+          "the current account is not a past one")
+    r = sb.run("use", "2", "nobody", "--json")
+    check(r.returncode == 1 and json.loads(r.stdout)["reason"] == "unknown_account",
+          "unknown account rejected")
+
+
+def test_use_refuses_live(sb: HistSandbox) -> None:
+    section("use <n> <account> refuses the live slot")
+    r = sb.run("use", "1", "x@example.com", "--json")
+    check(r.returncode == 1 and json.loads(r.stdout)["reason"] == "live", "reason is live")
+    check(sb.token(1) == "access-A" and sb.token(None) == "access-A", "live slot untouched")
+
+    r = sb.run("use", "2")
+    check(r.returncode == 0 and sb.state("live") == "2", "`use <n>` alone still swaps")
+    sb.run("swap", "1")
+
+
+def test_failure_keeps_slot(sb: HistSandbox) -> None:
+    section("a failed step leaves the slot on its account")
+    slot = sb.home / ".claude-slots" / "2"
+    before = (sb.token(2), sb.identity(2), sb.past(2))
+
+    slot.chmod(stat.S_IRUSR | stat.S_IXUSR)  # the credential write fails
+    try:
+        r = sb.run("use", "2", "x@example.com", "--json")
+    finally:
+        slot.chmod(0o755)
+    check(r.returncode == 1 and json.loads(r.stdout)["reason"] == "write_failed",
+          "credential write failure reported")
+    check((sb.token(2), sb.identity(2), sb.past(2)) == before, "slot and history unchanged")
+    check(sb.holders("refresh-X") == 1, "x is still in the vault, once")
+
+    ident = slot / ".claude.json"
+    ident.chmod(stat.S_IRUSR)  # credential lands, then the identity write fails
+    try:
+        r = sb.run("use", "2", "x@example.com", "--json")
+    finally:
+        ident.chmod(0o644)
+    check(r.returncode == 1 and json.loads(r.stdout)["reason"] == "write_failed",
+          "identity write failure reported")
+    check((sb.token(2), sb.identity(2), sb.past(2)) == before,
+          "credential rolled back, slot and history unchanged")
+    check(sb.holders("refresh-Y2") == 1 and sb.holders("refresh-X") == 1,
+          "no token duplicated by the rollback")
+
+
+def test_lock(sb: HistSandbox) -> None:
+    section("one change of a slot at a time, login included")
+    import fcntl
+    lock = sb.home / ".claude-profiles" / "history" / "slot2.lock"
+    before = (sb.token(2), sb.past(2))
+    fd = os.open(lock, os.O_CREAT | os.O_RDWR, 0o600)
+    fcntl.flock(fd, fcntl.LOCK_EX)
+    try:
+        r = sb.run("use", "2", "x@example.com", "--json")
+        check(r.returncode == 1 and json.loads(r.stdout)["reason"] == "busy", "use while held: busy")
+        r = sb.run("login", "2", FAKE_LOGIN="W:w@example.com")
+        check(r.returncode != 0 and "in progress" in r.stderr, "login while held: refused")
+        check((sb.token(2), sb.past(2)) == before, "slot and history untouched")
+    finally:
+        os.close(fd)
+    r = sb.run("use", "2", "x@example.com")
+    check(r.returncode == 0 and lock.exists(), "a lock file nobody holds does not block")
+    sb.run("use", "2", "y@example.com")
+
+
+def test_login_without_claude(sb: HistSandbox) -> None:
+    section("a login that cannot start leaves no duplicate in the vault")
+    before = (sb.token(2), sb.past(2))
+    empty = sb.home / "emptybin"
+    empty.mkdir(exist_ok=True)
+    r = sb.run("login", "2", PATH=str(empty))
+    check(r.returncode != 0 and "not on PATH" in r.stderr, "missing claude reported")
+    check((sb.token(2), sb.past(2)) == before, "slot and history unchanged")
+    check(sb.holders("refresh-Y2") == 1, "the slot's token was not left in the vault too")
+
+
+def test_live_login_archives_freshest(sb: HistSandbox) -> None:
+    section("login on the live slot archives the token the sessions kept rotating")
+    r = sb.run("login", "1", FAKE_LOGIN="Z:z@example.com", FAKE_ROTATE_LIVE="Q")
+    check(r.returncode == 0 and sb.token(None) == "access-Z", "live now holds z")
+    entry = next((e for e in sb.history(1).get("past", []) if e["email"] == "a@example.com"), None)
+    vault = Path(entry["dir"]) / ".credentials.json" if entry else None
+    check(bool(vault) and "refresh-Q" in vault.read_text(), "a's archive is the rotated token")
+    check(sb.holders("refresh-Q") == 1, "and it lives only in the vault")
+
+
+def test_rollback_failure_exit2(sb: HistSandbox) -> None:
+    section("a failed rollback is exit 2 and keeps the previous credential (in process)")
+    import importlib.util
+    from importlib.machinery import SourceFileLoader
+    saved = {k: os.environ.get(k) for k in ("HOME", "CCP_BACKEND")}
+    os.environ.update(HOME=str(sb.home), CCP_BACKEND="file")
+    try:
+        loader = SourceFileLoader("ccp_core", str(t.CCP))
+        core = importlib.util.module_from_spec(importlib.util.spec_from_loader("ccp_core", loader))
+        loader.exec_module(core)
+        hist = core.history().History(core)
+        slot_cred, original = core.slot_store(2).path, core.slot_store(2).read()
+        put = hist._put  # the rollback's write into the slot is the one that fails
+        hist._put = lambda store, blob: (False if blob == original and store.path == slot_cred
+                                         else put(store, blob))
+        hist._set_identity = lambda *_: (_ for _ in ()).throw(OSError("identity write failed"))
+        try:
+            hist.restore(2, "x@example.com")
+            code = 0
+        except core.history().Refused as r:
+            code = r.code
+    finally:
+        for k, v in saved.items():
+            os.environ.pop(k, None) if v is None else os.environ.__setitem__(k, v)
+    check(code == 2, "rollback failure exits 2")
+    check(sb.holders("refresh-Y2") >= 1 and "y@example.com" in sb.past(2),
+          "the previous credential is kept in the history")
+
+
+def test_live_login_locked_first(sb: HistSandbox) -> None:
+    section("login on the live slot changes nothing before it holds the lock")
+    import fcntl
+    lock = sb.home / ".claude-profiles" / "history" / "slot1.lock"
+    sb.put_cred(None, "L")  # the open sessions rotated the live token
+    fd = os.open(lock, os.O_CREAT | os.O_RDWR, 0o600)
+    fcntl.flock(fd, fcntl.LOCK_EX)
+    try:
+        r = sb.run("login", "1", FAKE_LOGIN="W:w@example.com")
+    finally:
+        os.close(fd)
+    check(r.returncode != 0 and "in progress" in r.stderr, "login of the live slot while held: refused")
+    check(sb.token(1) == "access-A", "slot1's store was not overwritten before the refusal")
+    sb.put_cred(None, "A")
+
+
+def test_swap_takes_lock(sb: HistSandbox) -> None:
+    section("swap waits for nobody: a slot being changed refuses it")
+    import fcntl
+    lock = sb.home / ".claude-profiles" / "history" / "slot2.lock"
+    fd = os.open(lock, os.O_CREAT | os.O_RDWR, 0o600)
+    fcntl.flock(fd, fcntl.LOCK_EX)
+    try:
+        r = sb.run("swap", "2")
+    finally:
+        os.close(fd)
+    check(r.returncode != 0 and "in progress" in r.stderr, "swap into a held slot: refused")
+    check(sb.state("live") == "1" and sb.token(None) == "access-A", "live untouched")
+
+
+def test_login_runs_on_empty_store(sb: HistSandbox) -> None:
+    section("/login never sees the outgoing credential: it is moved, not copied")
+    out = sb.get_cred(2)["refreshToken"]
+    held = sb.holders(out)  # the exit-2 test above leaves a copy in the vault on purpose
+    seen = sb.home / "seen-at-login"
+    r = sb.run("login", "2", FAKE_LOGIN="V:v@example.com", FAKE_SEEN="1")
+    check(r.returncode == 0 and sb.token(2) == "access-V", "slot2 now holds v")
+    check(seen.is_file() and out not in seen.read_text(), "/login started on an empty store")
+    check(sb.holders(out) == held, "the outgoing token was moved to the vault, not copied")
+
+    r = sb.run("login", "2", FAKE_SEEN="1")  # aborted
+    check(out not in seen.read_text() and sb.token(2) == "access-V",
+          "an aborted login puts the credential back intact")
+    check(sb.holders("refresh-V") == 1, "and leaves no copy behind")
+
+
+def test_purge_clears_vault(sb: HistSandbox) -> None:
+    section("purge deletes the saved credentials of past accounts, not only their dirs")
+    vault = sb.home / ".claude-profiles" / "history"
+    r = sb.run("history", "1", "--purge")
+    check(r.returncode == 0 and sb.past(1) == [], "history --purge empties the live slot's history")
+    check(sb.token(None) == "access-Z", "the live credential is left as it was")
+    r = sb.run("rm", "2", "--purge")
+    check(r.returncode == 0, "rm --purge exits 0")
+    left = [f for f in vault.rglob("*") if f.is_file() and "refreshToken" in f.read_text(errors="ignore")]
+    check(left == [], "no saved refresh token is left in the vault")
+
+
+def main() -> int:
+    print(f"ccp history tests · {sys.platform} · python {sys.version.split()[0]}")
+    sb = HistSandbox()
+    print(f"sandbox: {sb.home}")
+    try:
+        setup(sb)
+        test_login_archives(sb)
+        test_history_json(sb)
+        test_use_moves(sb)
+        test_use_refuses_live(sb)
+        test_failure_keeps_slot(sb)
+        test_lock(sb)
+        test_login_without_claude(sb)
+        test_rollback_failure_exit2(sb)
+        test_live_login_locked_first(sb)
+        test_swap_takes_lock(sb)
+        test_login_runs_on_empty_store(sb)
+        test_live_login_archives_freshest(sb)
+        test_purge_clears_vault(sb)
+    finally:
+        sb.stop()
+    print(f"\n{t.passed} passed, {t.failed} failed")
+    return 1 if t.failed else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

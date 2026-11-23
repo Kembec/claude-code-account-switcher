@@ -68,13 +68,13 @@ echo "    bindir:      $BINDIR"
 echo "    credentials: $STORE"
 
 mkdir -p "$BINDIR"
-for f in ccp ccp-statusline.py; do
+for f in ccp ccp_history.py ccp-statusline.py; do
   rm -f "$BINDIR/$f"
   if [ "$MODE" = copy ]; then cp "$REPO/bin/$f" "$BINDIR/$f"
   else ln -s "$REPO/bin/$f" "$BINDIR/$f"; fi
   chmod 755 "$BINDIR/$f" 2>/dev/null || true
 done
-echo "    placed ccp and ccp-statusline.py"
+echo "    placed ccp, ccp_history.py and ccp-statusline.py"
 
 # --- shell integration ------------------------------------------------------ #
 # `claude` must always run in the live config dir, because that is what makes one
