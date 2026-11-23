@@ -27,6 +27,10 @@ if rot:
     live = os.path.join(os.environ["HOME"], ".claude", ".credentials.json")
     open(live, "w").write(json.dumps({"claudeAiOauth": {"accessToken": "access-" + rot,
         "refreshToken": "refresh-" + rot, "expiresAt": int((time.time() + 8 * 3600) * 1000)}}))
+if os.environ.get("FAKE_SEEN"):  # what /login finds in the slot's store when it starts
+    c = os.path.join(os.environ["CLAUDE_CONFIG_DIR"], ".credentials.json")
+    open(os.path.join(os.environ["HOME"], "seen-at-login"), "w").write(
+        open(c).read() if os.path.isfile(c) else "")
 spec = os.environ.get("FAKE_LOGIN", "")
 if not spec:
     sys.exit(0)
@@ -248,6 +252,64 @@ def test_rollback_failure_exit2(sb: HistSandbox) -> None:
           "the previous credential is kept in the history")
 
 
+def test_live_login_locked_first(sb: HistSandbox) -> None:
+    section("login on the live slot changes nothing before it holds the lock")
+    import fcntl
+    lock = sb.home / ".claude-profiles" / "history" / "slot1.lock"
+    sb.put_cred(None, "L")  # the open sessions rotated the live token
+    fd = os.open(lock, os.O_CREAT | os.O_RDWR, 0o600)
+    fcntl.flock(fd, fcntl.LOCK_EX)
+    try:
+        r = sb.run("login", "1", FAKE_LOGIN="W:w@example.com")
+    finally:
+        os.close(fd)
+    check(r.returncode != 0 and "in progress" in r.stderr, "login of the live slot while held: refused")
+    check(sb.token(1) == "access-A", "slot1's store was not overwritten before the refusal")
+    sb.put_cred(None, "A")
+
+
+def test_swap_takes_lock(sb: HistSandbox) -> None:
+    section("swap waits for nobody: a slot being changed refuses it")
+    import fcntl
+    lock = sb.home / ".claude-profiles" / "history" / "slot2.lock"
+    fd = os.open(lock, os.O_CREAT | os.O_RDWR, 0o600)
+    fcntl.flock(fd, fcntl.LOCK_EX)
+    try:
+        r = sb.run("swap", "2")
+    finally:
+        os.close(fd)
+    check(r.returncode != 0 and "in progress" in r.stderr, "swap into a held slot: refused")
+    check(sb.state("live") == "1" and sb.token(None) == "access-A", "live untouched")
+
+
+def test_login_runs_on_empty_store(sb: HistSandbox) -> None:
+    section("/login never sees the outgoing credential: it is moved, not copied")
+    out = sb.get_cred(2)["refreshToken"]
+    held = sb.holders(out)  # the exit-2 test above leaves a copy in the vault on purpose
+    seen = sb.home / "seen-at-login"
+    r = sb.run("login", "2", FAKE_LOGIN="V:v@example.com", FAKE_SEEN="1")
+    check(r.returncode == 0 and sb.token(2) == "access-V", "slot2 now holds v")
+    check(seen.is_file() and out not in seen.read_text(), "/login started on an empty store")
+    check(sb.holders(out) == held, "the outgoing token was moved to the vault, not copied")
+
+    r = sb.run("login", "2", FAKE_SEEN="1")  # aborted
+    check(out not in seen.read_text() and sb.token(2) == "access-V",
+          "an aborted login puts the credential back intact")
+    check(sb.holders("refresh-V") == 1, "and leaves no copy behind")
+
+
+def test_purge_clears_vault(sb: HistSandbox) -> None:
+    section("purge deletes the saved credentials of past accounts, not only their dirs")
+    vault = sb.home / ".claude-profiles" / "history"
+    r = sb.run("history", "1", "--purge")
+    check(r.returncode == 0 and sb.past(1) == [], "history --purge empties the live slot's history")
+    check(sb.token(None) == "access-Z", "the live credential is left as it was")
+    r = sb.run("rm", "2", "--purge")
+    check(r.returncode == 0, "rm --purge exits 0")
+    left = [f for f in vault.rglob("*") if f.is_file() and "refreshToken" in f.read_text(errors="ignore")]
+    check(left == [], "no saved refresh token is left in the vault")
+
+
 def main() -> int:
     print(f"ccp history tests · {sys.platform} · python {sys.version.split()[0]}")
     sb = HistSandbox()
@@ -262,7 +324,11 @@ def main() -> int:
         test_lock(sb)
         test_login_without_claude(sb)
         test_rollback_failure_exit2(sb)
+        test_live_login_locked_first(sb)
+        test_swap_takes_lock(sb)
+        test_login_runs_on_empty_store(sb)
         test_live_login_archives_freshest(sb)
+        test_purge_clears_vault(sb)
     finally:
         sb.stop()
     print(f"\n{t.passed} passed, {t.failed} failed")

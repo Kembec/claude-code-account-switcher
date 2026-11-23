@@ -218,7 +218,7 @@ is exercised on every run.
 
 ```console
 python3 tests/test_ccp.py      # 58 checks, no network, touches nothing real
-python3 tests/test_history.py  # 41 checks: login archive, history, use, lock, rollback
+python3 tests/test_history.py  # 54 checks: login archive, history, use, lock, rollback, purge
 ```
 
 **Verified under PowerShell:** `install.ps1` parses clean on pwsh 7.6.4, the block it
@@ -277,8 +277,8 @@ session reads. Both `ccp` and the installer refuse to run under `sudo` for that 
 `pwsh -ExecutionPolicy Bypass -File .\uninstall.ps1` on Windows. Either takes out the
 command, the shell profile block and the statusline — and the PATH entry on Windows.
 Neither touches the live credential, so you stay signed in to whatever account is live.
-Add `--purge` (`-Purge` in PowerShell) to also delete the slot directories and their
-parked credentials.
+Add `--purge` (`-Purge` in PowerShell) to also delete the slot directories, their
+parked credentials and the saved credentials of their past accounts.
 
 ## License
 

@@ -38,6 +38,17 @@ if [ "$PURGE" = yes ]; then
       n=$(basename "$f" .dir | sed 's/^slot//')
       "$CCP" rm "$n" --purge >/dev/null 2>&1 && echo "    slot$n purged" || true
     done
+    # Past accounts of every slot, the live one included: their saved credentials are
+    # keychain items on macOS, which outlive the directories removed below.
+    for h in "$HOME"/.claude-profiles/history/slot*/; do
+      [ -d "$h" ] || continue
+      n=$(basename "$h" | sed 's/^slot//')
+      if "$CCP" history "$n" --purge >/dev/null 2>&1; then
+        echo "    slot$n history purged"
+      else
+        echo "    ! slot$n history: some saved credentials could not be deleted"
+      fi
+    done
   else
     echo "    ! ccp not on PATH; deleting slot dirs without clearing keychain items"
   fi

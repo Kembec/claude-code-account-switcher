@@ -29,7 +29,7 @@ import json
 import os
 import shutil
 import sys
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from datetime import datetime, timezone
 from hashlib import sha256
 from pathlib import Path
@@ -132,6 +132,17 @@ class History:
         shutil.rmtree(entry, ignore_errors=True)
         return True
 
+    def purge(self, n: int) -> int:
+        """Delete every past account of slot n, credential first: a keychain item
+        outlives its directory, with a live refresh token. Returns how many stayed."""
+        root = self.slot_root(n)
+        if not root.is_dir():
+            return 0
+        kept = sum(not self.drop(n, d.name) for d in list(root.iterdir()) if d.is_dir())
+        if not kept:
+            shutil.rmtree(root, ignore_errors=True)
+        return kept
+
     def find(self, n: int, token: str) -> dict:
         es = self.entries(n)
         hits = [e for e in es if e["key"] == token] or \
@@ -169,29 +180,47 @@ class History:
     # -- login hooks ---------------------------------------------------------- #
 
     def before_login(self, n: int):
-        """Archive the account a login is about to overwrite."""
-        key = self.archive(n)
-        return None if key is None else (key, self.identity(self.c.slot_dir(n))[:2])
+        """MOVE the account a login is about to overwrite into the vault.
 
-    def after_login(self, n: int, archived) -> None:
-        """Same account logged in again (or nothing changed): the archive is a stale
-        duplicate of what the slot now holds, so it goes. A different account, or a
-        login that left no credential, keeps it: that is the history."""
+        The slot's store is emptied before `claude /login` starts: a claude that
+        refreshes on start would otherwise rotate the token the vault just saved,
+        leaving a revoked copy that history reports as valid.
+        """
+        key = self.archive(n)
+        if key is None:
+            return None
+        ident, store = self.identity(self.c.slot_dir(n))[:2], self.c.slot_store(n)
+        if not (store.delete() and store.read() is None):
+            self.drop(n, key)  # the slot still holds it: nothing is lost
+            raise Refused("write_failed", f"could not empty slot{n}'s store before /login")
+        return key, ident
+
+    def after_login(self, n: int, archived) -> bool:
+        """Finish the move. No credential after /login: the archived one goes back,
+        untouched (True). Same account again: the archive is a stale duplicate and
+        goes. A different account keeps it: that is the history."""
         if archived is None:
-            return
+            return False
         key, ident = archived
-        if not self.c.valid_blob(self.c.slot_store(n).read()):
-            return
+        sstore = self.c.slot_store(n)
+        if not self.c.valid_blob(sstore.read()):
+            if self._put(sstore, self.c.store_for(self.slot_root(n) / key).read() or ""):
+                self.drop(n, key)
+            else:
+                print(f"ccp: warning: slot{n}'s previous credential could not be put back; "
+                      f"it stays in `ccp history {n}`", file=sys.stderr)
+            return True
         if self.identity(self.c.slot_dir(n))[:2] == ident:
             self.drop(n, key)
+        return False
 
     # -- restore -------------------------------------------------------------- #
 
     def restore(self, n: int, token: str) -> dict:
-        if n == self.c.live_slot():
-            raise Refused("live", f"slot{n} is live: every open session uses it. "
-                                  f"Swap to another slot first (`ccp swap <m>`).")
-        with self.locked(n):
+        with self.locked(n):  # swap takes it too: "live" cannot change under restore
+            if n == self.c.live_slot():
+                raise Refused("live", f"slot{n} is live: every open session uses it. "
+                                      f"Swap to another slot first (`ccp swap <m>`).")
             return self._restore(n, token)
 
     def _restore(self, n: int, token: str) -> dict:
@@ -265,8 +294,18 @@ def _emit(as_json: bool, payload: dict, text: str) -> None:
 def cmd_history(core, args: list[str]) -> None:
     pos = [a for a in args if not a.startswith("-")]
     if not pos:
-        core.die("usage: ccp history <n> [--json]")
+        core.die("usage: ccp history <n> [--json | --purge]")
     n, h = core.resolve(pos[0]), History(core)
+    if "--purge" in args:  # the live slot too: no session reads its past accounts
+        try:
+            with h.locked(n):
+                kept = h.purge(n)
+        except Refused as r:
+            core.die(r.detail)
+        if kept:
+            core.die(f"{kept} past account(s) of slot{n} could not be deleted")
+        print(f"OK slot{n}: past accounts and their saved credentials deleted")
+        return
     email, org, _ = h.identity(core.slot_dir(n))
     has = core.valid_blob(core.slot_store(n).read())
     current = {"email": email, "org": org, "has_credential": has,
@@ -300,42 +339,67 @@ def cmd_use(core, args: list[str]) -> None:
     if len([a for a in args if not a.startswith("-")]) >= 2:
         cmd_restore(core, args)
     else:
-        core.cmd_swap(args)
+        cmd_swap(core, args)
+
+
+def cmd_swap(core, args: list[str]) -> None:
+    """Swap under the locks of the two slots it writes (the target and the one it
+    parks), so a login, use or purge of either never interleaves with it."""
+    pos = [a for a in args if not a.startswith("-")]
+    if not pos:
+        return core.cmd_swap(args)  # usage
+    n, lv, hist = core.resolve(pos[0]), core.live_slot(), History(core)
+    try:
+        with hist.locked(n), (hist.locked(lv) if lv not in (None, n) else nullcontext()):
+            if core.live_slot() != lv:
+                raise Refused("busy", "the live slot changed meanwhile")
+            core.cmd_swap(args)
+    except Refused as r:
+        core.die(f"{r.detail} - swap not started")
+
+
+def purge_slot(core, n: int) -> None:
+    """`ccp rm <n> --purge`: the slot's credential, its past accounts, then its dir."""
+    core.slot_store(n).delete()
+    if History(core).purge(n):
+        core.die(f"slot{n}: some past accounts could not be deleted; dir kept")
+    shutil.rmtree(core.slot_dir(n), ignore_errors=True)
 
 
 def cmd_login(core, args: list[str]) -> None:
     """A login replaces the slot's account, so the outgoing one is archived first."""
     if not args:
         core.die("usage: ccp login <n>")
-    n = core.resolve(args[0])
+    n, hist = core.resolve(args[0]), History(core)
+    try:
+        with hist.locked(n):  # every change of the slot, the live re-park included
+            _login_locked(core, hist, n)
+    except Refused as r:
+        core.die(f"{r.detail} - login not started")
+
+
+def _login_locked(core, hist: History, n: int) -> None:
+    C = core.C
     core.sync(n, quiet=True)
     lv = core.live_slot()
     if n == lv:
         # the live store holds the freshest refresh token; archive that one
         core.copy_cred(core.live_store(), core.slot_store(n), f"parking slot{n}")
         core.park_identity(n)
-    hist = History(core)
-    try:
-        with hist.locked(n):  # a concurrent `use` would be overwritten by this login
-            _login_locked(core, hist, n, lv)
-    except Refused as r:
-        core.die(f"{r.detail} - login not started")
-
-
-def _login_locked(core, hist: History, n: int, lv: int | None) -> None:
-    C = core.C
-    archived = hist.before_login(n)  # the account this login may overwrite
+    archived = hist.before_login(n)  # moved out: /login runs on an empty store
     print(f"{C['d']}opening claude in slot{n} -> run /login and pick the account{C['0']}")
     try:
         core.run_claude(["/login"], core.slot_env(n))
     finally:
-        # also when claude is missing or the login dies: no duplicate is left behind
-        hist.after_login(n, archived)
+        # also when claude is missing or the login dies: the credential comes back
+        put_back = hist.after_login(n, archived)
     if not core.valid_blob(core.slot_store(n).read()):
         core.die(f"slot{n} still has no credential - the login did not complete")
     print(f"{C['g']}OK{C['0']} slot{n} · {core.account_of(n)}")
     if n != lv:
         print(f"  to use it in your open sessions: {C['c']}ccp swap {n}{C['0']}")
+        return
+    if put_back:  # no new login: the live store stays as the open sessions left it
         return
     # Live slot: open sessions kept rotating the outgoing token during /login, so the
     # archive is retaken from the live store right before that store is overwritten.

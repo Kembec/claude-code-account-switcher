@@ -610,9 +610,8 @@ def cmd_rm(args: list[str]) -> None:
         die(f"slot{n} is live. Swap to another slot before removing it.")
     (REG / f"slot{n}.dir").unlink(missing_ok=True)
     if "--purge" in args:
-        slot_store(n).delete()
-        shutil.rmtree(slot_dir(n), ignore_errors=True)
-        print(f"{C['g']}OK{C['0']} slot{n} removed: registration, dir and credential")
+        history().purge_slot(sys.modules[__name__], n)
+        print(f"{C['g']}OK{C['0']} slot{n} removed: registration, dir, credential, history")
     else:
         print(f"{C['g']}OK{C['0']} slot{n} unregistered "
               f"{C['d']}(dir and credential kept; `ccp add {n}` restores it){C['0']}")
@@ -732,7 +731,7 @@ Not affiliated with Anthropic. Use only with accounts you own.{C['0']}"""
 
 CMDS = {
     "ls": cmd_ls, "list": cmd_ls,
-    "swap": cmd_swap, "switch": cmd_swap,
+    **dict.fromkeys(("swap", "switch"), lambda a: history().cmd_swap(sys.modules[__name__], a)),
     "use": lambda a: history().cmd_use(sys.modules[__name__], a),
     "add": cmd_add, "new": cmd_add,
     "login": lambda a: history().cmd_login(sys.modules[__name__], a),

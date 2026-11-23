@@ -5,7 +5,9 @@
 - **A slot now keeps the accounts it held before.** `ccp login <n>` used to overwrite
   the slot's credential, so going back from account B to A needed a new `/login`. Now
   the outgoing account is moved into a per-slot vault (`~/.claude-profiles/history/`)
-  first; re-logging the same account, or an aborted login, leaves no duplicate.
+  first, and the slot's store stays empty while `/login` runs, so a claude that
+  refreshes on start cannot rotate the saved token; an aborted login puts it back
+  intact, and re-logging the same account leaves no duplicate.
 - `ccp history <n> [--json]` lists the slot's past accounts: email, org, archive date and
   whether the session is still there. It never prints a token.
 - `ccp use <n> <account>` puts a past account back and moves the current one into the
@@ -14,7 +16,10 @@
   account (exit 2 only if the rollback itself fails, with the credential still in the
   vault). It refuses the live slot, like `logout` and `pin`. `ccp use <n>` alone still
   swaps.
-- One change of a slot at a time: `login`, `use <n> <account>` and `restore` take an OS
+- `ccp history <n> --purge` deletes a slot's past accounts, credential first (live slot
+  included); `ccp rm <n> --purge` and `uninstall --purge` now do it too, so no refresh
+  token is left behind in the keychain.
+- One change of a slot at a time: `login`, `use <n> <account>`, `restore` and `swap` take an OS
   lock on `~/.claude-profiles/history/slot<n>.lock` (flock, or msvcrt on Windows), which
   the kernel releases if ccp dies, so a lock is never stale. A second change gets `busy`.
 - Logging in to the live slot archives the outgoing account from the live store right
