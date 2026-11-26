@@ -248,45 +248,39 @@ def expire_now(blob: str) -> str:
 # ("accountGrant") and what belongs to this user on this machine ("grows"): OAuth
 # tokens of remote MCP servers, plugin secrets. A swap moves the account only. Copying
 # the whole item logged the user out of Figma and every other OAuth MCP on each swap
-# (KEM-549), so these keys are merged into the destination instead of replaced.
+# (KEM-549). The live store is where those keys are refreshed and cleared, so loading
+# a slot keeps them exactly as live has them: a refreshed token and a logout both
+# survive. Parking copies live as it is, so the slot gets live's current keys.
 MACHINE_KEYS = ("mcpOAuth", "mcpOAuthClientConfig", "mcpXaaIdp", "mcpXaaIdpConfig",
                 "pluginSecrets", "coworkRemoteDevice")
 
 
-def _expires(v) -> int:
-    return (v.get("expiresAt") or 0) if isinstance(v, dict) else 0
-
-
-def keep_machine_keys(payload: str, current: str | None) -> str:
-    """`payload` with the destination's machine keys kept; per entry, the copy that
-    expires last wins (a refresh rotates the MCP refresh token), the destination on a tie."""
+def with_live_machine_keys(payload: str, live: str | None) -> str:
+    """The account from `payload`; the machine keys exactly as the live store has them."""
     try:
-        cur = json.loads(current) if current else {}
+        cur = json.loads(live) if live else {}
     except ValueError:
-        return payload
-    if not isinstance(cur, dict) or not any(k in cur for k in MACHINE_KEYS):
-        return payload
+        cur = {}
+    if not isinstance(cur, dict):
+        cur = {}
     d = json.loads(payload)
+    if all(cur.get(k) == d.get(k) and (k in cur) == (k in d) for k in MACHINE_KEYS):
+        return payload
     for k in MACHINE_KEYS:
-        if k not in cur:
-            continue
-        mine, theirs = cur[k], d.get(k)
-        if not (isinstance(mine, dict) and isinstance(theirs, dict)):
-            d[k] = mine
-            continue
-        merged = dict(theirs)
-        for entry, v in mine.items():
-            if entry not in merged or _expires(v) >= _expires(merged[entry]):
-                merged[entry] = v
-        d[k] = merged
+        if k in cur:
+            d[k] = cur[k]
+        else:
+            d.pop(k, None)
     return json.dumps(d, separators=(",", ":"))
 
 
-def copy_cred(src, dst, what: str, nudge: bool = False) -> None:
+def copy_cred(src, dst, what: str, nudge: bool = False, into_live: bool = False) -> None:
     blob = src.read()
     if not valid_blob(blob):
         die(f"{what}: source credential is missing or invalid ({src.describe()})")
-    payload = keep_machine_keys(expire_now(blob) if nudge else blob, dst.read())
+    payload = expire_now(blob) if nudge else blob
+    if into_live:
+        payload = with_live_machine_keys(payload, dst.read())
     if not dst.write(payload):
         die(f"{what}: write failed ({dst.describe()})")
     if dst.read() != payload:
@@ -565,7 +559,8 @@ def cmd_swap(args: list[str]) -> None:
 
     # 2) load the target slot as live
     nudge = "--lazy" not in args
-    copy_cred(slot_store(n), live_store(), f"loading slot{n}", nudge=nudge)
+    copy_cred(slot_store(n), live_store(), f"loading slot{n}", nudge=nudge,
+              into_live=True)
     load_identity(n)
     LIVE_STATE.write_text(f"{n}\n")
 

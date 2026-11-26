@@ -232,6 +232,14 @@ def test_mcp_oauth_stays(sb: Sandbox) -> None:
     check(back["mcpOAuth"]["figma|abc"]["accessToken"] == "figma-2",
           "the refreshed Figma token wins over slot1's parked older copy")
 
+    # The user logs out of Figma (/mcp) while slot1 is live: the parked copies must not bring it back.
+    del back["mcpOAuth"]
+    sb.cred_path(None).write_text(json.dumps(back))
+    sb.run("swap", "2")
+    sb.run("swap", "1")
+    check("mcpOAuth" not in json.loads(sb.cred_path(None).read_text()),
+          "a Figma logout survives two swaps")
+
 
 def test_guards(sb: Sandbox) -> None:
     section("guards protect the live slot's credential store")
