@@ -210,6 +210,37 @@ def test_rotation_is_preserved(sb: Sandbox) -> None:
     sb.run("swap", "1")
 
 
+def test_mcp_oauth_stays(sb: Sandbox) -> None:
+    section("MCP OAuth tokens stay with the user across swaps (KEM-549)")
+    soon = lambda h: int((time.time() + h * 3600) * 1000)
+    live = json.loads(sb.cred_path(None).read_text())
+    live["mcpOAuth"] = {"figma|abc": {"accessToken": "figma-1", "expiresAt": soon(1)}}
+    sb.cred_path(None).write_text(json.dumps(live))
+
+    r = sb.run("swap", "2")
+    after = json.loads(sb.cred_path(None).read_text())
+    check(r.returncode == 0 and sb.token(None).startswith("access-B"), "the account switched")
+    check(after.get("mcpOAuth", {}).get("figma|abc", {}).get("accessToken") == "figma-1",
+          "the Figma token is still in the live store after the swap")
+
+    # Claude Code refreshes the Figma token while slot2 is live.
+    after["mcpOAuth"]["figma|abc"] = {"accessToken": "figma-2", "expiresAt": soon(2)}
+    sb.cred_path(None).write_text(json.dumps(after))
+    sb.run("swap", "1")
+    back = json.loads(sb.cred_path(None).read_text())
+    check(sb.token(None).startswith("access-A"), "swapped back to slot1")
+    check(back["mcpOAuth"]["figma|abc"]["accessToken"] == "figma-2",
+          "the refreshed Figma token wins over slot1's parked older copy")
+
+    # The user logs out of Figma (/mcp) while slot1 is live: the parked copies must not bring it back.
+    del back["mcpOAuth"]
+    sb.cred_path(None).write_text(json.dumps(back))
+    sb.run("swap", "2")
+    sb.run("swap", "1")
+    check("mcpOAuth" not in json.loads(sb.cred_path(None).read_text()),
+          "a Figma logout survives two swaps")
+
+
 def test_guards(sb: Sandbox) -> None:
     section("guards protect the live slot's credential store")
     check(sb.state("live") == "1", "slot1 is live for these checks")
@@ -326,6 +357,7 @@ def main() -> int:
         test_init_and_add(sb)
         test_swap(sb)
         test_rotation_is_preserved(sb)
+        test_mcp_oauth_stays(sb)
         test_guards(sb)
         test_resolution(sb)
         test_lifecycle(sb)

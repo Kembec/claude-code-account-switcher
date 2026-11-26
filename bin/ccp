@@ -244,11 +244,45 @@ def expire_now(blob: str) -> str:
     return json.dumps(d, separators=(",", ":"))
 
 
-def copy_cred(src, dst, what: str, nudge: bool = False) -> None:
+# Claude Code (2.1.331) sorts the keys of its credential item into the account
+# ("accountGrant") and what belongs to this user on this machine ("grows"): OAuth
+# tokens of remote MCP servers, plugin secrets. A swap moves the account only. Copying
+# the whole item logged the user out of Figma and every other OAuth MCP on each swap
+# (KEM-549). The live store is where those keys are refreshed and cleared, so loading
+# a slot keeps them exactly as live has them: a refreshed token and a logout both
+# survive. Parking copies live as it is, so the slot gets live's current keys.
+MACHINE_KEYS = ("mcpOAuth", "mcpOAuthClientConfig", "mcpXaaIdp", "mcpXaaIdpConfig",
+                "pluginSecrets", "coworkRemoteDevice")
+
+
+def with_live_machine_keys(payload: str, live: str | None) -> str:
+    """The account from `payload`; the machine keys exactly as the live store has them."""
+    # A live store that cannot be read (keychain error, nothing live yet) says nothing
+    # about a logout: the slot's copy goes through as it is, never stripped.
+    try:
+        cur = json.loads(live) if live else None
+    except ValueError:
+        cur = None
+    if not isinstance(cur, dict):
+        return payload
+    d = json.loads(payload)
+    if all(cur.get(k) == d.get(k) and (k in cur) == (k in d) for k in MACHINE_KEYS):
+        return payload
+    for k in MACHINE_KEYS:
+        if k in cur:
+            d[k] = cur[k]
+        else:
+            d.pop(k, None)
+    return json.dumps(d, separators=(",", ":"))
+
+
+def copy_cred(src, dst, what: str, nudge: bool = False, into_live: bool = False) -> None:
     blob = src.read()
     if not valid_blob(blob):
         die(f"{what}: source credential is missing or invalid ({src.describe()})")
     payload = expire_now(blob) if nudge else blob
+    if into_live:
+        payload = with_live_machine_keys(payload, dst.read())
     if not dst.write(payload):
         die(f"{what}: write failed ({dst.describe()})")
     if dst.read() != payload:
@@ -527,7 +561,8 @@ def cmd_swap(args: list[str]) -> None:
 
     # 2) load the target slot as live
     nudge = "--lazy" not in args
-    copy_cred(slot_store(n), live_store(), f"loading slot{n}", nudge=nudge)
+    copy_cred(slot_store(n), live_store(), f"loading slot{n}", nudge=nudge,
+              into_live=True)
     load_identity(n)
     LIVE_STATE.write_text(f"{n}\n")
 
