@@ -257,12 +257,14 @@ MACHINE_KEYS = ("mcpOAuth", "mcpOAuthClientConfig", "mcpXaaIdp", "mcpXaaIdpConfi
 
 def with_live_machine_keys(payload: str, live: str | None) -> str:
     """The account from `payload`; the machine keys exactly as the live store has them."""
+    # A live store that cannot be read (keychain error, nothing live yet) says nothing
+    # about a logout: the slot's copy goes through as it is, never stripped.
     try:
-        cur = json.loads(live) if live else {}
+        cur = json.loads(live) if live else None
     except ValueError:
-        cur = {}
+        cur = None
     if not isinstance(cur, dict):
-        cur = {}
+        return payload
     d = json.loads(payload)
     if all(cur.get(k) == d.get(k) and (k in cur) == (k in d) for k in MACHINE_KEYS):
         return payload
