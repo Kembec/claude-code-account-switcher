@@ -244,11 +244,49 @@ def expire_now(blob: str) -> str:
     return json.dumps(d, separators=(",", ":"))
 
 
+# Claude Code (2.1.331) sorts the keys of its credential item into the account
+# ("accountGrant") and what belongs to this user on this machine ("grows"): OAuth
+# tokens of remote MCP servers, plugin secrets. A swap moves the account only. Copying
+# the whole item logged the user out of Figma and every other OAuth MCP on each swap
+# (KEM-549), so these keys are merged into the destination instead of replaced.
+MACHINE_KEYS = ("mcpOAuth", "mcpOAuthClientConfig", "mcpXaaIdp", "mcpXaaIdpConfig",
+                "pluginSecrets", "coworkRemoteDevice")
+
+
+def _expires(v) -> int:
+    return (v.get("expiresAt") or 0) if isinstance(v, dict) else 0
+
+
+def keep_machine_keys(payload: str, current: str | None) -> str:
+    """`payload` with the destination's machine keys kept; per entry, the copy that
+    expires last wins (a refresh rotates the MCP refresh token), the destination on a tie."""
+    try:
+        cur = json.loads(current) if current else {}
+    except ValueError:
+        return payload
+    if not isinstance(cur, dict) or not any(k in cur for k in MACHINE_KEYS):
+        return payload
+    d = json.loads(payload)
+    for k in MACHINE_KEYS:
+        if k not in cur:
+            continue
+        mine, theirs = cur[k], d.get(k)
+        if not (isinstance(mine, dict) and isinstance(theirs, dict)):
+            d[k] = mine
+            continue
+        merged = dict(theirs)
+        for entry, v in mine.items():
+            if entry not in merged or _expires(v) >= _expires(merged[entry]):
+                merged[entry] = v
+        d[k] = merged
+    return json.dumps(d, separators=(",", ":"))
+
+
 def copy_cred(src, dst, what: str, nudge: bool = False) -> None:
     blob = src.read()
     if not valid_blob(blob):
         die(f"{what}: source credential is missing or invalid ({src.describe()})")
-    payload = expire_now(blob) if nudge else blob
+    payload = keep_machine_keys(expire_now(blob) if nudge else blob, dst.read())
     if not dst.write(payload):
         die(f"{what}: write failed ({dst.describe()})")
     if dst.read() != payload:
